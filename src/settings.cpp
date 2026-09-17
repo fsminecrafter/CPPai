@@ -118,6 +118,7 @@ Settings load_settings(const std::string& path) {
     json_get_int  (json, "top_k",                s.top_k);
     json_get_bool (json, "use_gpu",              s.use_gpu);
     json_get_int  (json, "gpu_device",           s.gpu_device);
+    json_get_str  (json, "gpu_backend",         s.gpu_backend);
     json_get_bool (json, "auto_download",        s.auto_download);
     json_get_int  (json, "ad_max_books",         s.ad_max_books);
     json_get_uint64(json,"ad_max_bytes",         s.ad_max_bytes);
@@ -155,6 +156,7 @@ void save_settings(const Settings& s) {
     f << "  \"top_k\":               " << s.top_k        << ",\n";
     f << "  \"use_gpu\":             " << b(s.use_gpu)   << ",\n";
     f << "  \"gpu_device\":          " << s.gpu_device   << ",\n";
+    f << "  \"gpu_backend\":         \"" << json_escape(s.gpu_backend) << "\",\n";
     f << "  \"auto_download\":       " << b(s.auto_download)  << ",\n";
     f << "  \"ad_max_books\":        " << s.ad_max_books  << ",\n";
     f << "  \"ad_max_bytes\":        " << s.ad_max_bytes  << ",\n";

@@ -20,6 +20,9 @@
 #ifdef WITH_CUDA
 #  include "cuda_ops.h"
 #endif
+#ifdef WITH_VULKAN
+#  include "vulkan_ops.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -35,32 +38,49 @@ static std::vector<GpuDevice> enumerate_gpus() {
 #endif
 }
 
+static std::vector<GpuDevice> enumerate_vulkan_gpus() {
+#ifdef WITH_VULKAN
+    return vulkan_enumerate_devices();
+#else
+    return {};
+#endif
+}
+
 static std::string gpu_status_line(const Settings& s) {
-    auto devs = enumerate_gpus();
     if (!s.use_gpu) return "[CPU]";
-    if (devs.empty()) return "[GPU: no devices — using CPU]";
-    if (s.gpu_device >= static_cast<int>(devs.size()))
-        return "[GPU: device " + std::to_string(s.gpu_device) + " not found — using CPU]";
-    return "[GPU:" + std::to_string(s.gpu_device) + " " + devs[s.gpu_device].name + "]";
+    auto cuda = enumerate_gpus();
+    auto vulkan = enumerate_vulkan_gpus();
+    auto cuda_it = std::find_if(cuda.begin(), cuda.end(), [&](const GpuDevice& d) { return d.id == s.gpu_device; });
+    auto vulkan_it = std::find_if(vulkan.begin(), vulkan.end(), [&](const GpuDevice& d) { return d.id == s.gpu_device; });
+    bool use_cuda = s.gpu_backend != "vulkan" && cuda_it != cuda.end();
+    bool use_vulkan = !use_cuda && s.gpu_backend != "cuda" && vulkan_it != vulkan.end();
+    if (use_cuda) return "[CUDA:" + std::to_string(s.gpu_device) + " " + cuda_it->name + "]";
+    if (use_vulkan) return "[Vulkan:" + std::to_string(s.gpu_device) + " " + vulkan_it->name + "]";
+    return "[GPU: no matching device — using CPU]";
 }
 
 static void print_gpu_info(const Settings& s) {
     auto devs = enumerate_gpus();
     printf("  ── GPU\n");
     printf("    use_gpu:    %s\n", s.use_gpu ? "ON" : "OFF");
+    printf("    backend:    %s (auto prefers CUDA, then Vulkan)\n", s.gpu_backend.c_str());
 #ifdef WITH_CUDA
-    if (devs.empty()) {
-        printf("    (CUDA compiled in but no devices found)\n");
-    } else {
-        for (auto& d : devs) {
-            bool sel = (s.use_gpu && d.id == s.gpu_device);
-            printf("    [%d] %s  (%s)%s\n", d.id, d.name.c_str(),
-                   human_bytes(d.total_mem).c_str(),
-                   sel ? "  ◀ selected" : "");
-        }
+    for (auto& d : devs) {
+        bool sel = s.use_gpu && s.gpu_backend != "vulkan" && d.id == s.gpu_device;
+        printf("    CUDA [%d] %s  (%s)%s\n", d.id, d.name.c_str(),
+               human_bytes(d.total_mem).c_str(), sel ? "  <- selected" : "");
     }
 #else
-    printf("    (CUDA not compiled in — build with -DWITH_CUDA=ON)\n");
+    printf("    CUDA: not compiled in\n");
+#endif
+#ifdef WITH_VULKAN
+    for (auto& d : enumerate_vulkan_gpus()) {
+        bool sel = s.use_gpu && s.gpu_backend == "vulkan" && d.id == s.gpu_device;
+        printf("    Vulkan [%d] %s  (%s)%s\n", d.id, d.name.c_str(),
+               human_bytes(d.total_mem).c_str(), sel ? "  <- selected" : "");
+    }
+#else
+    printf("    Vulkan: not compiled in\n");
 #endif
 }
 
@@ -133,40 +153,42 @@ static bool confirm(const char* msg) {
 static void gpu_submenu(Settings& s) {
     while (true) {
         printf("\n── GPU Settings ────────────────────────────────────────\n");
-        printf("  use_gpu: %s  |  selected device: %d\n",
-               s.use_gpu ? "ON" : "OFF", s.gpu_device);
+        printf("  use_gpu: %s  |  backend: %s  |  selected device: %d\n",
+             s.use_gpu ? "ON" : "OFF", s.gpu_backend.c_str(), s.gpu_device);
         printf("\n");
         print_gpu_info(s);
         printf("\n");
         printf("1) Toggle GPU ON/OFF\n");
-        printf("2) Select GPU device\n");
+        printf("2) Select backend (auto/cuda/vulkan)\n");
+        printf("3) Select GPU device\n");
         printf("0) Back\n");
 
         auto c = read_line("> ");
         if (c == "1") {
 #ifdef WITH_CUDA
-            auto devs = enumerate_gpus();
-            if (devs.empty()) {
-                printf("No CUDA devices detected.\n");
-            } else {
-                s.use_gpu = !s.use_gpu;
-                printf("GPU: %s\n", s.use_gpu ? "ON" : "OFF");
-                save_settings(s);
-            }
+            s.use_gpu = !s.use_gpu;
+            printf("GPU: %s\n", s.use_gpu ? "ON" : "OFF");
+            save_settings(s);
 #else
-            printf("CUDA not compiled in. Rebuild with -DWITH_CUDA=ON.\n");
+            s.use_gpu = !s.use_gpu;
+            printf("GPU: %s\n", s.use_gpu ? "ON" : "OFF");
+            save_settings(s);
 #endif
         } else if (c == "2") {
-            auto devs = enumerate_gpus();
-            if (devs.empty()) {
-                printf("No CUDA devices available.\n");
-            } else {
-                for (auto& d : devs)
-                    printf("  [%d] %s\n", d.id, d.name.c_str());
+            auto backend = read_line("Backend (auto/cuda/vulkan): ");
+            if (backend == "auto" || backend == "cuda" || backend == "vulkan") {
+                s.gpu_backend = backend;
+                save_settings(s);
+                printf("Backend set to %s.\n", backend.c_str());
+            } else printf("Invalid backend.\n");
+        } else if (c == "3") {
+            auto devs = s.gpu_backend == "vulkan" ? enumerate_vulkan_gpus() : enumerate_gpus();
+            if (devs.empty()) printf("No devices available for backend %s.\n", s.gpu_backend.c_str());
+            else {
+                for (auto& d : devs) printf("  [%d] %s\n", d.id, d.name.c_str());
                 auto v = read_line("Enter device ID: ");
                 try {
-                    int n = std::stoi(v);
-                    bool valid = false;
+                    int n = std::stoi(v); bool valid = false;
                     for (auto& d : devs) if (d.id == n) valid = true;
                     if (valid) { s.gpu_device = n; save_settings(s); printf("Device set to %d.\n", n); }
                     else printf("Invalid device ID.\n");

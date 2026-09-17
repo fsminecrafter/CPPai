@@ -16,6 +16,9 @@
 
 //Cuda
 #include "cuda_ops.h"
+#ifdef WITH_VULKAN
+#include "vulkan_ops.h"
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -99,16 +102,34 @@ std::string generate_text(GPT& model, const Vocabulary& vocab,
 }
 
 void run_chat(Settings& s) {
+    bool using_cuda = false;
+    bool using_vulkan = false;
 #ifdef WITH_CUDA
-    if (s.use_gpu) {
+    if (s.use_gpu && s.gpu_backend != "vulkan") {
         auto devs = cuda_enumerate_devices();
-        if (s.gpu_device < static_cast<int>(devs.size()))
-            cuda_set_device(s.gpu_device);
-        else s.use_gpu = false;
+        auto device = std::find_if(devs.begin(), devs.end(),
+                                   [&](const GpuDevice& d) { return d.id == s.gpu_device; });
+        if (device == devs.end() && s.gpu_backend == "auto" && !devs.empty()) device = devs.begin();
+        if (device != devs.end()) {
+            s.gpu_device = device->id;
+            cuda_set_device(device->id);
+            using_cuda = true;
+        }
     }
-#else
-    s.use_gpu = false;
 #endif
+#ifdef WITH_VULKAN
+    if (s.use_gpu && !using_cuda && (s.gpu_backend == "vulkan" || s.gpu_backend == "auto")) {
+        auto devs = vulkan_enumerate_devices();
+        auto device = std::find_if(devs.begin(), devs.end(),
+                                   [&](const GpuDevice& d) { return d.id == s.gpu_device; });
+        if (device == devs.end() && s.gpu_backend == "auto" && !devs.empty()) device = devs.begin();
+        if (device != devs.end()) {
+            s.gpu_device = device->id;
+            using_vulkan = true;
+        }
+    }
+#endif
+    s.use_gpu = using_cuda || using_vulkan;
 
     GPT model;
     Vocabulary vocab;
@@ -116,10 +137,15 @@ void run_chat(Settings& s) {
         printf("No model found at '%s'. Train first.\n", s.model_file.c_str());
         return;
     }
-    if (s.use_gpu) model.to_device();
+    if (using_cuda) model.to_device();
+    if (using_vulkan && !model.to_vulkan(s.gpu_device)) {
+        s.use_gpu = false;
+        using_vulkan = false;
+    }
 
     printf("Model loaded [%s] — vocab=%d  block=%d  embed=%d  layers=%d  heads=%d  ffn=%d\n",
-           s.use_gpu ? ("GPU:" + std::to_string(s.gpu_device)).c_str() : "CPU",
+           using_cuda ? ("CUDA:" + std::to_string(s.gpu_device)).c_str() :
+           using_vulkan ? ("Vulkan:" + std::to_string(s.gpu_device)).c_str() : "CPU",
            vocab.size(), model.hp().block_size, model.hp().embed_dim,
            model.hp().n_layers, model.hp().n_heads, model.hp().ffn_dim);
     printf("Type 'exit' to quit.\n\n");

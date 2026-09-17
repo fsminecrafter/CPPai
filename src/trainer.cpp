@@ -441,7 +441,7 @@ void run_train(Settings& s) {
     const bool show   = s.show_progress;
 
 #ifdef WITH_CUDA
-    if (s.use_gpu) {
+    if (s.use_gpu && s.gpu_backend != "vulkan") {
         auto devs = cuda_enumerate_devices();
         if (s.gpu_device < static_cast<int>(devs.size())) {
             cuda_set_device(s.gpu_device);
@@ -451,9 +451,15 @@ void run_train(Settings& s) {
             printf("[GPU] Device %d not found — falling back to CPU.\n", s.gpu_device);
             s.use_gpu = false;
         }
+    } else if (s.use_gpu) {
+        printf("[CPU] Vulkan is inference-only — training uses CPU.\n");
+        s.use_gpu = false;
     }
 #else
-    if (s.use_gpu) printf("[CPU] CUDA not compiled in — running on CPU.\n");
+    if (s.use_gpu && s.gpu_backend == "vulkan")
+        printf("[CPU] Vulkan is inference-only — training uses CPU.\n");
+    else if (s.use_gpu)
+        printf("[CPU] CUDA not compiled in — running on CPU.\n");
     s.use_gpu = false;
 #endif
 

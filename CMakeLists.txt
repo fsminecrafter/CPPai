@@ -79,6 +79,7 @@ endif()
 target_include_directories(pyai PRIVATE
   ${CMAKE_SOURCE_DIR}/src
   ${CMAKE_SOURCE_DIR}/cuda
+  ${CMAKE_SOURCE_DIR}/vulkan
   ${CMAKE_SOURCE_DIR}/include
 )
 

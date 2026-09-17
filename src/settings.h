@@ -45,8 +45,9 @@ struct Settings {
     int   top_k               = 20;
 
     // ── GPU ───────────────────────────────────────────────────────────────
-    bool use_gpu   = false;
-    int  gpu_device = 0;
+    bool        use_gpu    = false;
+    int         gpu_device = 0;
+    std::string gpu_backend = "auto"; // auto, cuda, or vulkan
 
     // ── Auto-downloader ───────────────────────────────────────────────────
     bool   auto_download    = false;

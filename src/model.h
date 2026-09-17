@@ -114,8 +114,9 @@ public:
     GPT() = default;
     explicit GPT(const HParams& hp);
 
-    void to_device();   // upload to GPU (no-op on CPU build)
-    void to_cpu();      // download from GPU (no-op on CPU build)
+    void to_device();
+    bool to_vulkan(int device_id);
+    void to_cpu();
     bool on_device() const { return on_device_; }
 
     // Forward: ctx_ids [B x T] -> logits [B x T x V]
@@ -147,6 +148,7 @@ private:
     HParams hp_;
     Params  p_;
     bool    on_device_ = false;
+    bool    on_vulkan_ = false;
 
     void init_weights();
 };

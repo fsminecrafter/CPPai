@@ -26,6 +26,9 @@
 #ifdef WITH_CUDA
 #include "cuda_ops.h"
 #endif
+#ifdef WITH_VULKAN
+#include "vulkan_ops.h"
+#endif
 
 static constexpr float INIT_STD = 0.02f;
 static constexpr float LN_EPS   = 1e-5f;
@@ -566,14 +569,26 @@ int64_t GPT::num_params() const {
 
 void GPT::to_device() {
 #ifdef WITH_CUDA
+    on_vulkan_ = false;
     cuda_upload_gpt(p_, hp_);
     on_device_ = true;
+#endif
+}
+bool GPT::to_vulkan(int device_id) {
+#ifdef WITH_VULKAN
+    on_device_ = false;
+    on_vulkan_ = vulkan_set_device(device_id);
+    return on_vulkan_;
+#else
+    (void)device_id;
+    return false;
 #endif
 }
 void GPT::to_cpu() {
 #ifdef WITH_CUDA
     if (on_device_) { cuda_download_gpt(p_, hp_); on_device_ = false; }
 #endif
+    on_vulkan_ = false;
 }
 
 void GPT::forward(const int32_t* ctx_ids, int B, int T, float* logits_out, FwdCache& cache) const {
@@ -610,10 +625,17 @@ void GPT::forward(const int32_t* ctx_ids, int B, int T, float* logits_out, FwdCa
     cache.lnf_out.resize(static_cast<size_t>(N) * D);
     ln_forward(x.data(), p_.lnf_g.data(), p_.lnf_b.data(), N, D, cache.lnf_out.data(), cache.lnf);
 
-    matmul(cache.lnf_out.data(), p_.head_W.data(), logits_out, N, D, V);
-    for (int i = 0; i < N; ++i) {
-        float* li_ = logits_out + static_cast<size_t>(i) * V;
-        for (int j = 0; j < V; ++j) li_[j] += p_.head_b[j];
+    bool projected = false;
+#ifdef WITH_VULKAN
+    if (on_vulkan_)
+        projected = vulkan_head_projection(cache.lnf_out.data(), p_.head_W.data(), p_.head_b.data(), N, D, V, logits_out);
+#endif
+    if (!projected) {
+        matmul(cache.lnf_out.data(), p_.head_W.data(), logits_out, N, D, V);
+        for (int i = 0; i < N; ++i) {
+            float* li_ = logits_out + static_cast<size_t>(i) * V;
+            for (int j = 0; j < V; ++j) li_[j] += p_.head_b[j];
+        }
     }
 }
 
