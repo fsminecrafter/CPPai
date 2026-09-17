@@ -22,19 +22,19 @@
 #include <iostream>
 #include <iomanip>
 #include <filesystem>
+#include <atomic>
 
-// zlib for gzip
 #include <zlib.h>
 
 #ifdef WITH_CUDA
 #  include "cuda_ops.h"
 #endif
- 
 
 namespace fs = std::filesystem;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Vocab streaming build
+// Vocab streaming build  (unchanged from the pre-transformer trainer — the
+// vocabulary itself doesn't depend on the model architecture)
 // ─────────────────────────────────────────────────────────────────────────────
 
 VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
@@ -66,12 +66,10 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
             }
         }
     } else {
-        // Per-worker partial counts merged under mutex
         int actual_workers = std::min(workers, n_files);
         std::vector<std::unordered_map<std::string,int64_t>> partial(actual_workers);
         std::vector<int64_t> worker_tokens(actual_workers, 0);
         std::vector<std::future<void>> futures;
-        std::mutex merge_mtx;
         std::atomic<int> file_cursor{0};
 
         for (int w = 0; w < actual_workers; ++w) {
@@ -88,7 +86,9 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
                 }));
         }
 
-        // Progress display while waiting
+        // Progress display runs on this (calling) thread independently of the
+        // worker threads, so it redraws at a fixed cadence rather than only
+        // when a worker happens to finish a file.
         while (done_count.load() < n_files) {
             if (show_progress) {
                 int dc = done_count.load();
@@ -99,7 +99,7 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
                        human_num(static_cast<double>(total_so_far)).c_str());
                 fflush(stdout);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            sleep_ms(100);
         }
         for (auto& f : futures) f.get();
 
@@ -117,41 +117,42 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DatasetChunk
+// SeqDataset — non-overlapping [N x block_size] sequences
 // ─────────────────────────────────────────────────────────────────────────────
 
-void DatasetChunk::build(const std::vector<int32_t>& ids, int ctx_len, int pad_id) {
+void SeqDataset::build(const std::vector<int32_t>& ids, int block_size) {
     int n = static_cast<int>(ids.size());
-    N = n;
-    X.resize(static_cast<size_t>(n) * ctx_len);
-    Y.resize(n);
-
-    // Prepend ctx_len pad tokens
-    for (int i = 0; i < n; ++i) {
-        Y[i] = ids[i];
-        for (int t = 0; t < ctx_len; ++t) {
-            int src = i - ctx_len + t;
-            X[static_cast<size_t>(i) * ctx_len + t] =
-                (src < 0) ? pad_id : ids[src];
+    int n_seq = (n - 1) / block_size;
+    N = std::max(0, n_seq);
+    X.assign(static_cast<size_t>(N) * block_size, 0);
+    Y.assign(static_cast<size_t>(N) * block_size, 0);
+    for (int s = 0; s < N; ++s) {
+        for (int t = 0; t < block_size; ++t) {
+            X[static_cast<size_t>(s) * block_size + t] = ids[static_cast<size_t>(s) * block_size + t];
+            Y[static_cast<size_t>(s) * block_size + t] = ids[static_cast<size_t>(s) * block_size + t + 1];
         }
     }
 }
 
-void DatasetChunk::shuffle() {
-    // Fisher-Yates on indices, then apply in-place
+void SeqDataset::shuffle() {
+    if (N <= 1) return;
     static std::mt19937 rng(std::random_device{}());
+    const int block_size = static_cast<int>(X.size() / N);
     std::vector<int> idx(N);
     std::iota(idx.begin(), idx.end(), 0);
     for (int i = N - 1; i > 0; --i) {
         std::uniform_int_distribution<int> d(0, i);
         std::swap(idx[i], idx[d(rng)]);
     }
-    const int C = static_cast<int>(X.size()) / N;
-    std::vector<int32_t> Xn(X.size()), Yn(N);
+    std::vector<int32_t> Xn(X.size()), Yn(Y.size());
     for (int i = 0; i < N; ++i) {
         int j = idx[i];
-        Yn[i] = Y[j];
-        std::copy(X.begin() + j*C, X.begin() + j*C+C, Xn.begin() + i*C);
+        std::copy(X.begin() + static_cast<ptrdiff_t>(j) * block_size,
+                  X.begin() + static_cast<ptrdiff_t>(j) * block_size + block_size,
+                  Xn.begin() + static_cast<ptrdiff_t>(i) * block_size);
+        std::copy(Y.begin() + static_cast<ptrdiff_t>(j) * block_size,
+                  Y.begin() + static_cast<ptrdiff_t>(j) * block_size + block_size,
+                  Yn.begin() + static_cast<ptrdiff_t>(i) * block_size);
     }
     X = std::move(Xn);
     Y = std::move(Yn);
@@ -161,14 +162,12 @@ void DatasetChunk::shuffle() {
 // Model I/O (gzip-compressed)
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool save_model(const NeuralLM& model, const Vocabulary& vocab, const std::string& path) {
-    // Serialize to memory buffer first
+bool save_model(const GPT& model, const Vocabulary& vocab, const std::string& path) {
     std::ostringstream ss(std::ios::binary);
     vocab.write(ss);
     model.write(ss);
     std::string buf = ss.str();
 
-    // gzip compress
     gzFile gz = gzopen(path.c_str(), "wb9");
     if (!gz) return false;
     gzwrite(gz, buf.data(), static_cast<unsigned>(buf.size()));
@@ -176,7 +175,7 @@ bool save_model(const NeuralLM& model, const Vocabulary& vocab, const std::strin
     return true;
 }
 
-bool load_model(const std::string& path, NeuralLM& model_out, Vocabulary& vocab_out) {
+bool load_model(const std::string& path, GPT& model_out, Vocabulary& vocab_out) {
     if (!fs::exists(path)) return false;
 
     gzFile gz = gzopen(path.c_str(), "rb");
@@ -192,17 +191,155 @@ bool load_model(const std::string& path, NeuralLM& model_out, Vocabulary& vocab_
 
     std::istringstream ss(buf, std::ios::binary);
     vocab_out = Vocabulary::read(ss);
-    HParams hp;  // will be overwritten inside NeuralLM::read
-    model_out = NeuralLM::read(ss, hp);
+    model_out = GPT::read(ss);
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Chunk iterator: yields flat encoded token lists of ≤ chunk_size tokens
+// Threaded progress bar for a run of batches.
+//
+// The renderer runs on its own thread and redraws at a fixed ~80ms cadence
+// (read from atomics the compute thread updates after each batch), so the
+// bar's on-screen refresh rate no longer depends on how fast a batch runs —
+// it stays smooth whether a batch takes 2ms (small model, GPU) or 200ms
+// (large model, CPU).
 // ─────────────────────────────────────────────────────────────────────────────
 
-static std::vector<int32_t>
-encode_file(const std::string& path, const Vocabulary& vocab, bool lowercase) {
+template <typename StepFn>
+static double run_batches_with_progress(int chunk_idx, int N, int batch_size,
+                                         bool show_progress, StepFn&& step_fn) {
+    const int batches_total = (N + batch_size - 1) / batch_size;
+    std::atomic<int>    batches_done{0};
+    std::atomic<double> avg_loss{0.0};
+    std::atomic<bool>   active{true};
+    const double t0 = now_sec();
+
+    std::thread renderer;
+    if (show_progress) {
+        renderer = std::thread([&]() {
+            while (active.load(std::memory_order_relaxed)) {
+                int bd = batches_done.load(std::memory_order_relaxed);
+                double elapsed  = std::max(0.001, now_sec() - t0);
+                double samp_sec = (static_cast<double>(bd) * batch_size) / elapsed;
+                std::string bar = format_bar(bd, batches_total, 24);
+                printf("\r  Chunk %d %s %5.1f%%  loss=%.4f  %s/s  |  %s    ",
+                       chunk_idx, bar.c_str(),
+                       100.0 * bd / std::max(1, batches_total),
+                       avg_loss.load(std::memory_order_relaxed),
+                       human_num(samp_sec).c_str(),
+                       sys_usage_str().c_str());
+                fflush(stdout);
+                sleep_ms(80);
+            }
+        });
+    }
+
+    double total_loss = 0.0;
+    int bi = 0;
+    for (int b_start = 0; b_start < N; b_start += batch_size) {
+        int B = std::min(batch_size, N - b_start);
+        double loss = step_fn(b_start, B);
+        total_loss += loss;
+        ++bi;
+        avg_loss.store(total_loss / bi, std::memory_order_relaxed);
+        batches_done.store(bi, std::memory_order_relaxed);
+    }
+
+    active.store(false, std::memory_order_relaxed);
+    if (renderer.joinable()) renderer.join();
+    if (show_progress) {
+        // Final, exact redraw (the last background frame may be a hair stale).
+        printf("\r  Chunk %d %s 100.0%%  loss=%.4f  |  %s    \n",
+               chunk_idx, format_bar(batches_total, batches_total, 24).c_str(),
+               bi ? total_loss / bi : 0.0, sys_usage_str().c_str());
+    }
+    return bi ? total_loss / bi : 0.0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generic Adam step over LayerParams / StageHead (small parameter packs used
+// only by staged training). Adam over the full model's Params lives in
+// AdamState (model.cpp); this mirrors it for the smaller structs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void collect(LayerParams& L, std::vector<std::vector<float>*>& v) {
+    v.push_back(&L.ln1_g); v.push_back(&L.ln1_b);
+    v.push_back(&L.attn_Wq); v.push_back(&L.attn_Wk); v.push_back(&L.attn_Wv);
+    v.push_back(&L.attn_Wo); v.push_back(&L.attn_bo);
+    v.push_back(&L.ln2_g); v.push_back(&L.ln2_b);
+    v.push_back(&L.mlp_W1); v.push_back(&L.mlp_b1);
+    v.push_back(&L.mlp_W2); v.push_back(&L.mlp_b2);
+}
+static void collect_const(const LayerParams& L, std::vector<const std::vector<float>*>& v) {
+    v.push_back(&L.ln1_g); v.push_back(&L.ln1_b);
+    v.push_back(&L.attn_Wq); v.push_back(&L.attn_Wk); v.push_back(&L.attn_Wv);
+    v.push_back(&L.attn_Wo); v.push_back(&L.attn_bo);
+    v.push_back(&L.ln2_g); v.push_back(&L.ln2_b);
+    v.push_back(&L.mlp_W1); v.push_back(&L.mlp_b1);
+    v.push_back(&L.mlp_W2); v.push_back(&L.mlp_b2);
+}
+static void collect(StageHead& S, std::vector<std::vector<float>*>& v) {
+    v.push_back(&S.ln_g); v.push_back(&S.ln_b);
+    v.push_back(&S.head_W); v.push_back(&S.head_b);
+}
+static void collect_const(const StageHead& S, std::vector<const std::vector<float>*>& v) {
+    v.push_back(&S.ln_g); v.push_back(&S.ln_b);
+    v.push_back(&S.head_W); v.push_back(&S.head_b);
+}
+
+static LayerParams zero_like(const LayerParams& p) {
+    LayerParams z;
+    z.ln1_g.assign(p.ln1_g.size(), 0.f);     z.ln1_b.assign(p.ln1_b.size(), 0.f);
+    z.attn_Wq.assign(p.attn_Wq.size(), 0.f); z.attn_Wk.assign(p.attn_Wk.size(), 0.f);
+    z.attn_Wv.assign(p.attn_Wv.size(), 0.f); z.attn_Wo.assign(p.attn_Wo.size(), 0.f);
+    z.attn_bo.assign(p.attn_bo.size(), 0.f);
+    z.ln2_g.assign(p.ln2_g.size(), 0.f);     z.ln2_b.assign(p.ln2_b.size(), 0.f);
+    z.mlp_W1.assign(p.mlp_W1.size(), 0.f);   z.mlp_b1.assign(p.mlp_b1.size(), 0.f);
+    z.mlp_W2.assign(p.mlp_W2.size(), 0.f);   z.mlp_b2.assign(p.mlp_b2.size(), 0.f);
+    return z;
+}
+static StageHead zero_like(const StageHead& p) {
+    StageHead z;
+    z.ln_g.assign(p.ln_g.size(), 0.f);   z.ln_b.assign(p.ln_b.size(), 0.f);
+    z.head_W.assign(p.head_W.size(), 0.f); z.head_b.assign(p.head_b.size(), 0.f);
+    return z;
+}
+
+template <typename T>
+struct SmallAdam {
+    T m, v;
+    int t = 0;
+    float lr = 0.0003f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+
+    void init(const T& like) { m = zero_like(like); v = zero_like(like); }
+
+    void step(T& params, const T& grads) {
+        ++t;
+        float bc1 = 1.f - std::pow(beta1, t);
+        float bc2 = 1.f - std::pow(beta2, t);
+        float lr_t = lr * std::sqrt(bc2) / bc1;
+
+        std::vector<std::vector<float>*> P, M, V;
+        std::vector<const std::vector<float>*> G;
+        collect(params, P); collect(m, M); collect(v, V); collect_const(grads, G);
+        for (size_t k = 0; k < P.size(); ++k) {
+            auto& pp = *P[k]; auto& mm = *M[k]; auto& vv = *V[k]; const auto& gg = *G[k];
+            for (size_t i = 0; i < pp.size(); ++i) {
+                mm[i] = beta1 * mm[i] + (1.f - beta1) * gg[i];
+                vv[i] = beta2 * vv[i] + (1.f - beta2) * gg[i] * gg[i];
+                pp[i] -= lr_t * mm[i] / (std::sqrt(vv[i]) + eps);
+            }
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming chunk iteration helper — reused by both staged and joint training.
+// Accumulates tokens from files into a buffer and hands back <= chunk_tokens
+// slices at a time, so only ~1 chunk's worth of raw tokens is ever resident.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::vector<int32_t> encode_file(const std::string& path, const Vocabulary& vocab, bool lowercase) {
     auto toks = tokenize_file(path, lowercase);
     std::vector<int32_t> ids;
     ids.reserve(toks.size());
@@ -210,15 +347,95 @@ encode_file(const std::string& path, const Vocabulary& vocab, bool lowercase) {
     return ids;
 }
 
+template <typename ChunkFn>
+static void for_each_token_chunk(const std::vector<std::string>& files, const Vocabulary& vocab,
+                                  bool lowercase, size_t chunk_tokens, ChunkFn&& fn) {
+    std::vector<int32_t> buf;
+    buf.reserve(chunk_tokens + 100000);
+    for (auto& file : files) {
+        auto ids = encode_file(file, vocab, lowercase);
+        buf.insert(buf.end(), ids.begin(), ids.end());
+        while (buf.size() >= chunk_tokens) {
+            std::vector<int32_t> chunk(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(chunk_tokens));
+            buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(chunk_tokens));
+            fn(chunk);
+        }
+    }
+    if (!buf.empty()) fn(buf);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Main training loop
+// Staged (layer-by-layer) warm-up training for a single block `li`.
+// Mirrors main.py's train_staged_block(): blocks [0,li) are frozen (forward
+// only, cache discarded), a throwaway stage head sits on block li, and only
+// block li's weights are updated.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void train_staged_block(GPT& model, const Vocabulary& vocab,
+                                const std::vector<std::string>& files,
+                                size_t chunk_tokens, int li, int block_size,
+                                int batch_size, float lr, bool lowercase,
+                                int stage_epochs, bool show_progress) {
+    const HParams& hp = model.hp();
+    StageHead stage_head = init_stage_head(hp.embed_dim, hp.vocab_size,
+                                            static_cast<unsigned>(1234 + li));
+    SmallAdam<LayerParams> adam_block; adam_block.lr = lr;
+    SmallAdam<StageHead>   adam_stage; adam_stage.lr = lr;
+    adam_block.init(model.params().layers[li]);
+    adam_stage.init(stage_head);
+
+    for (int ep = 1; ep <= stage_epochs; ++ep) {
+        double ep_loss = 0.0;
+        int    ep_batches = 0;
+        int    chunk_idx = 0;
+
+        for_each_token_chunk(files, vocab, lowercase, chunk_tokens, [&](std::vector<int32_t>& ids) {
+            ++chunk_idx;
+            SeqDataset ds; ds.build(ids, block_size); ds.shuffle();
+            if (ds.N == 0) return;
+
+            double avg = run_batches_with_progress(chunk_idx, ds.N, batch_size, show_progress,
+                [&](int b_start, int B) -> double {
+                    const int32_t* Xb = ds.X.data() + static_cast<size_t>(b_start) * block_size;
+                    const int32_t* Yb = ds.Y.data() + static_cast<size_t>(b_start) * block_size;
+
+                    auto x_in = model.forward_frozen_prefix(Xb, B, block_size, li);
+
+                    std::vector<float> logits;
+                    StageCache cache;
+                    gpt_stage_forward(model.params(), hp, stage_head, x_in, B, block_size, li, logits, cache);
+
+                    std::vector<float> dlogits;
+                    float loss = compute_loss_and_dlogits(logits.data(), Yb, B, block_size, hp.vocab_size, dlogits);
+
+                    LayerParams block_grads = zero_like(model.params().layers[li]);
+                    StageHead   stage_grads = zero_like(stage_head);
+                    gpt_stage_backward(model.params(), hp, stage_head, dlogits.data(), cache,
+                                        B, block_size, li, block_grads, stage_grads);
+
+                    adam_block.step(model.params().layers[li], block_grads);
+                    adam_stage.step(stage_head, stage_grads);
+                    return static_cast<double>(loss);
+                });
+
+            ep_loss += avg * ds.N;
+            ep_batches += ds.N;
+        });
+
+        printf("    epoch %d/%d  avg loss=%.4f\n", ep, stage_epochs,
+               ep_batches ? ep_loss / ep_batches : 0.0);
+    }
+    // stage_head goes out of scope here — only block li's trained weights persist.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main training entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
 void run_train(Settings& s) {
     const bool single = s.single_thread;
     const bool show   = s.show_progress;
 
-    // ── GPU backend ──────────────────────────────────────────────────────────
 #ifdef WITH_CUDA
     if (s.use_gpu) {
         auto devs = cuda_enumerate_devices();
@@ -236,6 +453,11 @@ void run_train(Settings& s) {
     s.use_gpu = false;
 #endif
 
+    if (s.embed_dim % s.n_heads != 0) {
+        printf("embed_dim (%d) must be divisible by n_heads (%d).\n", s.embed_dim, s.n_heads);
+        return;
+    }
+
     ensure_folder(s.input_folder);
     auto files = find_text_files(s.input_folder);
     if (files.empty()) {
@@ -243,11 +465,11 @@ void run_train(Settings& s) {
         return;
     }
 
-    printf("\n=== Neural LM Training  [%s] ===\n",
+    printf("\n=== Transformer LM Training  [%s] ===\n",
            s.use_gpu ? ("GPU:" + std::to_string(s.gpu_device)).c_str() : "CPU");
-    printf("Files: %d  |  Vocab: %d  |  ctx=%d  embed=%d  hidden=%d\n",
-           (int)files.size(), s.vocab_size, s.ctx_len, s.embed_dim, s.hidden_dim);
-    printf("Epochs: %d  |  Batch: %d  |  LR: %.4f\n",
+    printf("Files: %d  |  Vocab: %d  |  block_size=%d  d_model=%d  layers=%d  heads=%d  ffn=%d\n",
+           (int)files.size(), s.vocab_size, s.block_size, s.embed_dim, s.n_layers, s.n_heads, s.ffn_dim);
+    printf("Epochs: %d  |  Batch: %d sequences  |  LR: %.5f\n",
            s.epochs, s.batch_size, s.learning_rate);
     {
         size_t avail = available_ram_bytes();
@@ -256,145 +478,117 @@ void run_train(Settings& s) {
                human_bytes(avail).c_str(), human_bytes(total).c_str());
     }
 
-    // ── Pass 1: build vocab ──────────────────────────────────────────────────
-    auto vr = build_vocab_streaming(files, s.lowercase, s.vocab_size,
-                                    s.workers, single, show);
+    auto vr = build_vocab_streaming(files, s.lowercase, s.vocab_size, s.workers, single, show);
     auto& vocab = vr.vocab;
     printf("  Vocab size: %d  |  Total tokens: %s\n",
            vocab.size(), human_num(static_cast<double>(vr.total_tokens)).c_str());
 
-    size_t chunk_tokens   = estimate_chunk_tokens(s.ctx_len);
-    int    chunks_approx  = static_cast<int>(
+    size_t chunk_tokens  = estimate_chunk_tokens(s.block_size);
+    int    chunks_approx = static_cast<int>(
         std::max<int64_t>(1, vr.total_tokens / static_cast<int64_t>(chunk_tokens)));
     printf("  Chunk size: ~%s tokens  (≈%d chunk(s) per epoch)\n\n",
            human_num(static_cast<double>(chunk_tokens)).c_str(), chunks_approx);
 
-    // ── Init model + Adam ────────────────────────────────────────────────────
     HParams hp;
     hp.vocab_size = vocab.size();
     hp.embed_dim  = s.embed_dim;
-    hp.ctx_len    = s.ctx_len;
-    hp.hidden_dim = s.hidden_dim;
+    hp.block_size = s.block_size;
+    hp.n_layers   = s.n_layers;
+    hp.n_heads    = s.n_heads;
+    hp.ffn_dim    = s.ffn_dim;
 
-    NeuralLM model(hp);
+    GPT model(hp);
     if (s.use_gpu) model.to_device();
 
     AdamState adam;
-    adam.lr    = s.learning_rate;
-    adam.init(model.params());
+    adam.lr = s.learning_rate;
+    adam.init(hp);
 
     printf("  Parameters: %s\n", human_num(static_cast<double>(model.num_params())).c_str());
 
+    // ── Optional staged (layer-by-layer) warm-up ────────────────────────────
+    std::string train_mode = s.train_mode;
+    std::transform(train_mode.begin(), train_mode.end(), train_mode.begin(), ::tolower);
+
+    if (train_mode == "staged") {
+        printf("\n=== Staged warm-up: %d block(s), %d epoch(s) each ===\n",
+               s.n_layers, s.stage_epochs);
+        for (int li = 0; li < s.n_layers; ++li) {
+            if (li > 0)
+                printf("  -- Stage %d/%d: training block h%d (blocks 0..%d frozen) --\n",
+                       li + 1, s.n_layers, li, li - 1);
+            else
+                printf("  -- Stage %d/%d: training block h%d --\n", li + 1, s.n_layers, li);
+
+            train_staged_block(model, vocab, files, chunk_tokens, li, s.block_size,
+                                s.batch_size, s.learning_rate, s.lowercase,
+                                s.stage_epochs, show);
+
+            model.to_cpu();
+            save_model(model, vocab, s.model_file);
+            if (s.use_gpu) model.to_device();
+        }
+        printf("\n=== Joint fine-tune: all %d layers together (train_mode=normal from here) ===\n",
+               s.n_layers);
+    }
+
     double global_start = now_sec();
 
-    // ── Training epochs ───────────────────────────────────────────────────────
     for (int epoch = 1; epoch <= s.epochs; ++epoch) {
         double epoch_start   = now_sec();
         double epoch_loss    = 0.0;
+        int64_t epoch_seqs   = 0;
         int    epoch_batches = 0;
-        int64_t epoch_samples = 0;
+        int    chunk_idx = 0;
 
-        printf("\n── Epoch %d/%d ──────────────────────────────────────\n",
-               epoch, s.epochs);
+        printf("\n── Epoch %d/%d ──────────────────────────────────────\n", epoch, s.epochs);
 
-        // Accumulate tokens across files into chunks
-        std::vector<int32_t> buf;
-        buf.reserve(chunk_tokens + 100000);
-        int chunk_idx = 0;
-
-        auto process_chunk = [&](std::vector<int32_t>& ids) {
+        for_each_token_chunk(files, vocab, s.lowercase, chunk_tokens, [&](std::vector<int32_t>& ids) {
             ++chunk_idx;
-            double chunk_start = now_sec();
-
-            DatasetChunk dc;
-            dc.build(ids, s.ctx_len, vocab.pad_id());
-            ids.clear();
-            dc.shuffle();
-
-            const int N  = dc.N;
-            const int C  = s.ctx_len;
-            const int V  = vocab.size();
-            int batches_in_chunk = (N + s.batch_size - 1) / s.batch_size;
-
-            double chunk_loss    = 0.0;
-            int    chunk_batches = 0;
+            SeqDataset ds; ds.build(ids, s.block_size); ds.shuffle();
+            if (ds.N == 0) return;
 
             FwdCache cache;
-            Params   grads;
+            std::vector<float> logits;
+            std::vector<float> dlogits;
+            Params grads;
 
-            std::vector<float> logits(static_cast<size_t>(s.batch_size) * V);
+            double avg = run_batches_with_progress(chunk_idx, ds.N, s.batch_size, show,
+                [&](int b_start, int B) -> double {
+                    const int32_t* Xb = ds.X.data() + static_cast<size_t>(b_start) * s.block_size;
+                    const int32_t* Yb = ds.Y.data() + static_cast<size_t>(b_start) * s.block_size;
 
-            for (int b_start = 0; b_start < N; b_start += s.batch_size) {
-                int B = std::min(s.batch_size, N - b_start);
-                const int32_t* Xb = dc.X.data() + static_cast<size_t>(b_start) * C;
-                const int32_t* Yb = dc.Y.data() + b_start;
- 
-                float loss;
+                    float loss;
 #ifdef WITH_CUDA
-                if (s.use_gpu) {
-                    ++adam.t;  // keep CPU adam_t in sync for checkpoint consistency
-                    loss = cuda_train_step(model.params(), model.hp(),
-                                           Xb, Yb, B,
-                                           *model.cuda_ws_,
-                                           adam.lr, adam.beta1, adam.beta2, adam.eps,
-                                           adam.t);
-                } else
+                    if (s.use_gpu) {
+                        ++adam.t;
+                        loss = cuda_gpt_train_step(model.params(), hp, Xb, Yb, B, s.block_size,
+                                                    adam.lr, adam.beta1, adam.beta2, adam.eps, adam.t);
+                    } else
 #endif
-                {
-                    if (static_cast<int>(logits.size()) < B * V)
-                        logits.resize(static_cast<size_t>(B) * V);
-                    model.forward(Xb, B, logits.data(), cache);
-                    loss = model.backward(logits.data(), Yb, B, cache, grads);
-                    adam.step(model.params(), grads);
-                }
+                    {
+                        logits.resize(static_cast<size_t>(B) * s.block_size * hp.vocab_size);
+                        model.forward(Xb, B, s.block_size, logits.data(), cache);
+                        loss = compute_loss_and_dlogits(logits.data(), Yb, B, s.block_size, hp.vocab_size, dlogits);
+                        model.backward(dlogits.data(), cache, grads);
+                        adam.step(model.params(), grads);
+                    }
+                    return static_cast<double>(loss);
+                });
 
-
-                chunk_loss    += loss;
-                chunk_batches += 1;
-                epoch_loss    += loss;
-                epoch_batches += 1;
-                epoch_samples += B;
-
-                if (show && (chunk_batches % 20 == 0 || chunk_batches == batches_in_chunk)) {
-                    double elapsed  = std::max(0.001, now_sec() - chunk_start);
-                    double avg_loss = chunk_loss / chunk_batches;
-                    double samp_sec = (chunk_batches * s.batch_size) / elapsed;
-                    std::string bar = format_bar(chunk_batches, batches_in_chunk, 24);
-                    std::string usage = sys_usage_str();
-                    printf("\r  Chunk %d %s %5.1f%%  loss=%.4f  %s/s  |  %s    ",
-                           chunk_idx, bar.c_str(),
-                           100.0 * chunk_batches / batches_in_chunk,
-                           avg_loss, human_num(samp_sec).c_str(),
-                           usage.c_str());
-                    fflush(stdout);
-                }
-            }
-            if (show) printf("\n");
-        };
-
-        for (auto& file : files) {
-            auto ids = encode_file(file, vocab, s.lowercase);
-            buf.insert(buf.end(), ids.begin(), ids.end());
-
-            while (buf.size() >= chunk_tokens) {
-                std::vector<int32_t> chunk(buf.begin(),
-                                           buf.begin() + static_cast<ptrdiff_t>(chunk_tokens));
-                buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(chunk_tokens));
-                process_chunk(chunk);
-            }
-        }
-        if (!buf.empty()) process_chunk(buf);
+            epoch_loss    += avg * ds.N;
+            epoch_batches += (ds.N + s.batch_size - 1) / s.batch_size;
+            epoch_seqs    += ds.N;
+        });
 
         double epoch_elapsed = now_sec() - epoch_start;
-        double avg_loss = epoch_loss / std::max(1, epoch_batches);
-        printf("  Epoch %d done — %d chunk(s)  avg loss=%.4f  samples=%s  time=%.1fs\n",
-               epoch, chunk_idx, avg_loss,
-               human_num(static_cast<double>(epoch_samples)).c_str(), epoch_elapsed);
+        printf("  Epoch %d done — %d chunk(s)  avg loss=%.4f  sequences=%s  time=%.1fs\n",
+               epoch, chunk_idx, epoch_seqs ? epoch_loss / epoch_seqs : 0.0,
+               human_num(static_cast<double>(epoch_seqs)).c_str(), epoch_elapsed);
 
-        // Save checkpoint
-        if (model.to_cpu(), save_model(model, vocab, s.model_file)) {
+        model.to_cpu();
+        if (save_model(model, vocab, s.model_file))
             printf("  Checkpoint saved → %s\n", s.model_file.c_str());
-        }
         if (s.use_gpu) model.to_device();
     }
 

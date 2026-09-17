@@ -43,9 +43,6 @@ namespace fs = std::filesystem;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #ifdef NLM_WINDOWS
-// ── Windows: WinHTTP ─────────────────────────────────────────────────────────
-// Fixed: WINHTTP_OPTION_REDIRECT_POLICY set to ALWAYS so Gutenberg 301 → HTTPS
-// is followed transparently.
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 
@@ -68,7 +65,6 @@ static std::string http_get(const std::string& url,
                                   WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSes) return {};
 
-    // Follow redirects automatically (fixes Gutenberg HTTP→HTTPS 301)
     DWORD redir_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
     WinHttpSetOption(hSes, WINHTTP_OPTION_REDIRECT_POLICY,
                      &redir_policy, sizeof(redir_policy));
@@ -106,16 +102,9 @@ static std::string http_get(const std::string& url,
 }
 
 #else
-// ── Linux/macOS: curl via popen ───────────────────────────────────────────────
-// Using curl handles: HTTPS, HTTP→HTTPS 301 redirects (-L), per-request
-// timeouts (--max-time / --connect-timeout), and all TLS negotiation.
-// No extra link-time dependency — curl is available on every modern Linux
-// distro and macOS out of the box.
-
 static std::string http_get(const std::string& url,
                              int timeout_sec,
                              bool head_only = false) {
-    // Shell-escape the URL: wrap in single-quotes and escape any embedded '
     std::string safe_url;
     safe_url.reserve(url.size() + 2);
     for (char c : url) {
@@ -125,7 +114,6 @@ static std::string http_get(const std::string& url,
 
     char cmd[2048];
     if (head_only) {
-        // HEAD request — only fetch headers, discard body
         snprintf(cmd, sizeof(cmd),
             "curl -sS -L -I "
             "--max-time %d --connect-timeout 10 "
@@ -159,11 +147,7 @@ static std::string http_get(const std::string& url,
 // Text cleaning helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Strip Project Gutenberg header/footer boilerplate.
-// The header ends at the first "*** START OF" marker (any case variant).
-// The footer begins at "*** END OF" (any case variant).
 static std::string strip_gutenberg_boilerplate(const std::string& raw) {
-    // Find start marker (case-insensitive scan for "*** START OF")
     static const std::string START_PAT = "*** START OF";
     static const std::string END_PAT   = "*** END OF";
 
@@ -185,22 +169,19 @@ static std::string strip_gutenberg_boilerplate(const std::string& raw) {
 
     size_t text_begin = 0;
     if (start_pos != std::string::npos) {
-        // Skip the entire "*** START OF … ***" line
         size_t nl = raw.find('\n', start_pos);
         text_begin = (nl != std::string::npos) ? nl + 1 : start_pos + START_PAT.size();
     }
 
     size_t text_end = raw.size();
     if (end_pos != std::string::npos && end_pos > text_begin) {
-        // Walk back to start of that line
         text_end = (end_pos > 0) ? end_pos : 0;
     }
 
-    if (text_end <= text_begin) return raw;   // markers not found / malformed
+    if (text_end <= text_begin) return raw;
     return raw.substr(text_begin, text_end - text_begin);
 }
 
-// Collapse runs of blank lines (> 2 consecutive \n) to a single blank line.
 static std::string normalise_whitespace(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -217,29 +198,23 @@ static std::string normalise_whitespace(const std::string& s) {
     return out;
 }
 
-// Remove MediaWiki markup tags common in Wikisource extracts.
 static std::string strip_wikitext(std::string s) {
-    // Remove {{template}} blocks (non-nested for simplicity)
     {
         std::regex tmpl(R"(\{\{[^}]*\}\})");
         s = std::regex_replace(s, tmpl, "");
     }
-    // Remove [[File:...]] / [[Image:...]]
     {
         std::regex file_link(R"(\[\[(File|Image):[^\]]*\]\])", std::regex::icase);
         s = std::regex_replace(s, file_link, "");
     }
-    // Turn [[link|text]] → text, [[link]] → link
     {
         std::regex wlink(R"(\[\[(?:[^\]|]*\|)?([^\]]+)\]\])");
         s = std::regex_replace(s, wlink, "$1");
     }
-    // Remove HTML tags
     {
         std::regex html(R"(<[^>]+>)");
         s = std::regex_replace(s, html, "");
     }
-    // Remove == Section headers ==
     {
         std::regex heading(R"(={2,}[^=\n]+={2,})");
         s = std::regex_replace(s, heading, "");
@@ -258,7 +233,6 @@ static std::string gutenberg_url(int id) {
 
 static bool probe_gutenberg(int id) {
     auto body = http_get(gutenberg_url(id), GB_PROBE_TIMEOUT, /*head*/false);
-    // A real book is large plain text; a 404/redirect page is tiny.
     return body.size() >= GB_MIN_BYTES;
 }
 
@@ -275,7 +249,6 @@ static std::set<int> already_downloaded(const std::string& folder) {
     return have;
 }
 
-// Download one Gutenberg book; returns dest path or "" on failure.
 static std::string download_gutenberg(int id, const std::string& folder) {
     std::string dest = folder + "/pg" + std::to_string(id) + ".txt";
     if (fs::exists(dest)) return {};
@@ -283,9 +256,8 @@ static std::string download_gutenberg(int id, const std::string& folder) {
     auto body = http_get(gutenberg_url(id), GB_DL_TIMEOUT);
     if (body.size() < GB_MIN_BYTES) return {};
 
-    // Strip boilerplate and normalise whitespace
     std::string text = normalise_whitespace(strip_gutenberg_boilerplate(body));
-    if (text.size() < GB_MIN_BYTES / 2) text = body;  // fallback: save raw
+    if (text.size() < GB_MIN_BYTES / 2) text = body;
 
     std::ofstream f(dest, std::ios::binary);
     if (!f) return {};
@@ -293,7 +265,6 @@ static std::string download_gutenberg(int id, const std::string& folder) {
     return dest;
 }
 
-// Discover usable Gutenberg IDs via concurrent probing.
 static std::vector<int> discover_gutenberg_ids(
         int needed, const std::set<int>& skip,
         std::set<int>& discovered, std::set<int>& rejected,
@@ -375,12 +346,8 @@ static std::vector<int> ready_gutenberg_ids(const std::string& folder,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wikipedia source
-// Uses the Wikipedia REST API: /page/summary/{title} returns a plain-text
-// extract in the "extract" field.  We fetch a random article, then its full
-// extract via /page/plain-text/{title}.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Simple JSON string extractor (no full JSON parser needed here)
 static std::string json_str(const std::string& json, const std::string& key) {
     std::string pat = "\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"";
     std::regex  re(pat);
@@ -389,7 +356,6 @@ static std::string json_str(const std::string& json, const std::string& key) {
     return {};
 }
 
-// URL-encode a string for use as a path segment
 static std::string url_encode(const std::string& s) {
     std::string out;
     for (unsigned char c : s) {
@@ -406,20 +372,15 @@ static std::string url_encode(const std::string& s) {
     return out;
 }
 
-// Fetch one random Wikipedia article; return plain text or "" on failure.
-// We use the REST v1 API which returns actual article text, not just a summary.
 static std::string fetch_wikipedia_article(const std::string& lang = "en") {
-    // Step 1: get a random article title via the action API
     std::string rand_url = "https://" + lang + ".wikipedia.org/w/api.php"
         "?action=query&list=random&rnnamespace=0&rnlimit=1&format=json";
     auto rand_json = http_get(rand_url, GB_PROBE_TIMEOUT);
     if (rand_json.empty()) return {};
 
-    // Extract title: "title":"Article Name"
     std::string title = json_str(rand_json, "title");
     if (title.empty()) return {};
 
-    // Step 2: fetch plain-text extract via the REST summary endpoint
     std::string enc_title = url_encode(title);
     std::string extract_url = "https://" + lang + ".wikipedia.org/api/rest_v1/page/summary/"
                             + enc_title;
@@ -427,9 +388,8 @@ static std::string fetch_wikipedia_article(const std::string& lang = "en") {
     if (summary_json.empty()) return {};
 
     std::string extract = json_str(summary_json, "extract");
-    if (extract.size() < 500) return {};  // stub or disambiguation page
+    if (extract.size() < 500) return {};
 
-    // Unescape basic JSON escapes (\n, \t, \", \\)
     std::string text;
     text.reserve(extract.size());
     for (size_t i = 0; i < extract.size(); ++i) {
@@ -449,7 +409,6 @@ static std::string fetch_wikipedia_article(const std::string& lang = "en") {
     return normalise_whitespace(text);
 }
 
-// Save a Wikipedia article to a file; returns dest or "" on failure.
 static std::string download_wikipedia(int seq_id, const std::string& folder) {
     std::string dest = folder + "/wiki_" + std::to_string(seq_id) + ".txt";
     if (fs::exists(dest)) return {};
@@ -465,12 +424,9 @@ static std::string download_wikipedia(int seq_id, const std::string& folder) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Wikisource source
-// Uses the MediaWiki API to fetch random pages from Wikisource, then strips
-// wikitext markup.
 // ─────────────────────────────────────────────────────────────────────────────
 
 static std::string fetch_wikisource_page() {
-    // Random page in main namespace
     std::string rand_url = "https://en.wikisource.org/w/api.php"
         "?action=query&list=random&rnnamespace=0&rnlimit=1&format=json";
     auto rand_json = http_get(rand_url, GB_PROBE_TIMEOUT);
@@ -479,7 +435,6 @@ static std::string fetch_wikisource_page() {
     std::string title = json_str(rand_json, "title");
     if (title.empty()) return {};
 
-    // Fetch wikitext
     std::string enc = url_encode(title);
     std::string content_url = "https://en.wikisource.org/w/api.php"
         "?action=query&titles=" + enc +
@@ -488,7 +443,6 @@ static std::string fetch_wikisource_page() {
     auto content_json = http_get(content_url, GB_DL_TIMEOUT);
     if (content_json.empty()) return {};
 
-    // Extract wikitext from "content":"…" field
     std::string wikitext = json_str(content_json, "content");
     if (wikitext.size() < 500) return {};
 
@@ -511,18 +465,14 @@ static std::string download_wikisource(int seq_id, const std::string& folder) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Standard Ebooks source
-// Standard Ebooks provides clean, DRM-free plain text at predictable URLs.
-// We use their OPDS catalog to discover titles, then fetch the text/plain link.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Fetch all plain-text download links from the Standard Ebooks OPDS catalog.
 static std::vector<std::string> fetch_stdebooks_catalog() {
     const std::string catalog_url =
         "https://standardebooks.org/feeds/opds/all";
-    auto xml = http_get(catalog_url, 30 /*sec*/);
+    auto xml = http_get(catalog_url, 30);
     if (xml.empty()) return {};
 
-    // Extract <link … type="text/plain" … href="…"/> or vice-versa
     std::vector<std::string> urls;
     std::regex link_re(R"raw(<link[^>]*type="text/plain"[^>]*href="([^"]+)")raw",
                        std::regex::icase);
@@ -530,7 +480,6 @@ static std::vector<std::string> fetch_stdebooks_catalog() {
          it != end; ++it) {
         urls.push_back((*it)[1]);
     }
-    // Also catch href-before-type ordering
     std::regex link_re2(R"raw(<link[^>]*href="([^"]+)"[^>]*type="text/plain")raw",
                         std::regex::icase);
     for (std::sregex_iterator it(xml.begin(), xml.end(), link_re2), end;
@@ -542,7 +491,6 @@ static std::vector<std::string> fetch_stdebooks_catalog() {
     return urls;
 }
 
-// Cache the Standard Ebooks URL list so we don't re-fetch the catalog each run.
 static std::vector<std::string>& stdebooks_url_cache() {
     static std::vector<std::string> cache;
     return cache;
@@ -559,7 +507,6 @@ static std::string pick_stdebooks_url() {
     static std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<size_t> dist(0, cache.size() - 1);
     std::string url = cache[dist(rng)];
-    // Prefix with https://standardebooks.org if relative
     if (!url.empty() && url[0] == '/') url = "https://standardebooks.org" + url;
     return url;
 }
@@ -581,16 +528,14 @@ static std::string download_stdebooks(int seq_id, const std::string& folder) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Unified "download one item" dispatcher
+// Unified dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
 
-// A DownloadTask carries everything needed to download one file from any source.
 struct DownloadTask {
-    int    source;    // DS_* constant
-    int    seq_id;    // numeric ID or sequence counter
+    int    source;
+    int    seq_id;
 };
 
-// Dispatch to the right source, return dest path or "".
 static std::string dispatch_download(const DownloadTask& task,
                                       const std::string& folder) {
     switch (task.source) {
@@ -602,19 +547,14 @@ static std::string dispatch_download(const DownloadTask& task,
     }
 }
 
-// Build a mixed task list according to the sources bitmask in Settings.
-// We allocate slots to each enabled source proportionally.
 static std::vector<DownloadTask> build_task_list(const Settings& s, int slots) {
     std::vector<int> active;
     for (int bit : {DS_GUTENBERG, DS_WIKIPEDIA, DS_WIKISOURCE, DS_STD_EBOOKS})
         if (s.ad_sources & bit) active.push_back(bit);
-    if (active.empty()) active.push_back(DS_GUTENBERG);  // fallback
+    if (active.empty()) active.push_back(DS_GUTENBERG);
 
     std::vector<DownloadTask> tasks;
 
-    // Count existing files per source to generate unique seq_ids.
-    // For Gutenberg we use the real book IDs; for others a running counter
-    // starting after existing files of that type.
     auto count_source_files = [&](const std::string& prefix) -> int {
         int n = 0;
         if (!fs::exists(s.input_folder)) return 0;
@@ -644,15 +584,10 @@ static std::vector<DownloadTask> build_task_list(const Settings& s, int slots) {
         }
     }
 
-    // Shuffle so sources interleave nicely in the download queue
     std::mt19937 rng(std::random_device{}());
     std::shuffle(tasks.begin(), tasks.end(), rng);
     return tasks;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Serial download
-// ─────────────────────────────────────────────────────────────────────────────
 
 static const char* source_label(int src) {
     switch (src) {
@@ -702,10 +637,6 @@ static void download_serial(const std::vector<DownloadTask>& tasks,
         save_id_cache("discovered.json", disc);
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Parallel download with live progress
-// ─────────────────────────────────────────────────────────────────────────────
 
 static void download_parallel(const std::vector<DownloadTask>& tasks,
                                const std::string& folder,
@@ -854,7 +785,6 @@ void auto_download_blocking(Settings& s, bool multithreaded,
 
     int slots = s.ad_max_books - st.count;
 
-    // Print active sources
     std::string src_str;
     for (auto& p : std::vector<std::pair<int,const char*>>{
             {DS_GUTENBERG,"Gutenberg"},{DS_WIKIPEDIA,"Wikipedia"},
