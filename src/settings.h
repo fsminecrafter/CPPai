@@ -54,7 +54,9 @@ struct Settings {
     size_t ad_max_bytes     = 100 * 1024 * 1024; // 100 MB
     int    ad_refill_below  = 5;
     // Data sources bitmask (DS_* constants from neurallm.h)
-    int    ad_sources       = 0xF;  // all sources by default
+    // Gutenberg is the reliable long-form default. Other sources can be
+    // enabled deliberately with the DS_* bitmask in settings.json.
+    int    ad_sources       = 0x1;  // DS_GUTENBERG
 };
 
 // Load from JSON file (fills defaults for missing keys)

@@ -39,6 +39,10 @@
 
 namespace fs = std::filesystem;
 
+// A few sentences, an API error, or a navigation page is not useful LM
+// training data. Keep the same lower bound across every source.
+static constexpr size_t MIN_TRAINING_TEXT_BYTES = 10 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform HTTP layer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,10 +224,10 @@ static std::string download_gutenberg(int id, const std::string& folder) {
     if (fs::exists(dest)) return {};
 
     auto body = http_get(gutenberg_url(id), GB_DL_TIMEOUT);
-    if (body.size() < GB_MIN_BYTES) return {};
+    if (body.size() < MIN_TRAINING_TEXT_BYTES) return {};
 
     std::string text = normalise_whitespace(strip_project_gutenberg_boilerplate(body));
-    if (text.size() < GB_MIN_BYTES / 2) text = body;
+    if (text.size() < MIN_TRAINING_TEXT_BYTES) return {};
 
     std::ofstream f(dest, std::ios::binary);
     if (!f) return {};
@@ -247,25 +251,28 @@ static std::vector<int> discover_gutenberg_ids(
     std::mutex mu;
     std::atomic<int> cursor{0};
 
-    auto worker = [&]() {
-        while (true) {
-            int idx = cursor.fetch_add(1);
-            if (idx >= static_cast<int>(all.size())) return;
-            int id = all[idx];
-            bool ok = probe_gutenberg(id);
-            std::lock_guard<std::mutex> lk(mu);
-            (ok ? discovered : rejected).insert(id);
-            if (ok) good.push_back(id);
-        }
-    };
-
     int batch = probe_workers * 4;
     size_t pos = 0;
     while (static_cast<int>(good.size()) < needed && pos < all.size()) {
         size_t end = std::min(pos + static_cast<size_t>(batch), all.size());
         cursor.store(static_cast<int>(pos));
         std::vector<std::thread> ths;
-        for (int i = 0; i < probe_workers; ++i) ths.emplace_back(worker);
+        for (int i = 0; i < probe_workers; ++i) {
+            ths.emplace_back([&]() {
+                while (true) {
+                    int idx = cursor.fetch_add(1);
+                    // Do not let a worker run beyond this probe batch. The
+                    // prior implementation ignored `end` and could scan tens
+                    // of thousands of IDs before the caller could download.
+                    if (idx >= static_cast<int>(end)) return;
+                    int id = all[idx];
+                    bool ok = probe_gutenberg(id);
+                    std::lock_guard<std::mutex> lk(mu);
+                    (ok ? discovered : rejected).insert(id);
+                    if (ok) good.push_back(id);
+                }
+            });
+        }
         for (auto& t : ths) t.join();
         pos = end;
         if (verbose) {
@@ -354,7 +361,7 @@ static std::string fetch_wikipedia_article(const std::string& lang = "en") {
     if (summary_json.empty()) return {};
 
     std::string extract = json_str(summary_json, "extract");
-    if (extract.size() < 500) return {};
+    if (extract.size() < MIN_TRAINING_TEXT_BYTES) return {};
 
     std::string text;
     text.reserve(extract.size());
@@ -380,7 +387,7 @@ static std::string download_wikipedia(int seq_id, const std::string& folder) {
     if (fs::exists(dest)) return {};
 
     auto text = fetch_wikipedia_article();
-    if (text.size() < 500) return {};
+    if (text.size() < MIN_TRAINING_TEXT_BYTES) return {};
 
     std::ofstream f(dest, std::ios::binary);
     if (!f) return {};
@@ -410,10 +417,10 @@ static std::string fetch_wikisource_page() {
     if (content_json.empty()) return {};
 
     std::string wikitext = json_str(content_json, "content");
-    if (wikitext.size() < 500) return {};
+    if (wikitext.size() < MIN_TRAINING_TEXT_BYTES) return {};
 
     std::string text = normalise_whitespace(strip_wikitext(wikitext));
-    return text;
+    return text.size() >= MIN_TRAINING_TEXT_BYTES ? text : std::string{};
 }
 
 static std::string download_wikisource(int seq_id, const std::string& folder) {
@@ -421,7 +428,7 @@ static std::string download_wikisource(int seq_id, const std::string& folder) {
     if (fs::exists(dest)) return {};
 
     auto text = fetch_wikisource_page();
-    if (text.size() < 500) return {};
+    if (text.size() < MIN_TRAINING_TEXT_BYTES) return {};
 
     std::ofstream f(dest, std::ios::binary);
     if (!f) return {};
@@ -485,7 +492,7 @@ static std::string download_stdebooks(int seq_id, const std::string& folder) {
     if (url.empty()) return {};
 
     auto text = http_get(url, GB_DL_TIMEOUT);
-    if (text.size() < GB_MIN_BYTES) return {};
+    if (text.size() < MIN_TRAINING_TEXT_BYTES) return {};
 
     std::ofstream f(dest, std::ios::binary);
     if (!f) return {};
@@ -610,8 +617,8 @@ static void download_parallel(const std::vector<DownloadTask>& tasks,
                                int workers) {
     int n = static_cast<int>(tasks.size());
     workers = std::min(workers, n);
-    printf("  Downloading %d items from %d source(s) with %d threads…\n\n",
-           n, workers, workers);
+    printf("  Downloading %d items with %d worker%s…\n\n",
+           n, workers, workers == 1 ? "" : "s");
 
     struct ItemStatus {
         int source = 0; int seq_id = 0;
@@ -652,6 +659,9 @@ static void download_parallel(const std::vector<DownloadTask>& tasks,
                 int filled = (st.total > 0)
                     ? static_cast<int>((double)st.done / st.total * bar_w)
                     : std::min((int)(st.done / (GB_MIN_BYTES * 4.0) * bar_w), bar_w-1);
+                // Keep the trailing-arrow calculation valid even if a
+                // transport reports more bytes than its Content-Length.
+                filled = std::clamp(filled, 0, bar_w - 1);
                 std::string bar(filled, '=');
                 bar += '>'; bar.append(bar_w - filled - 1, '-');
                 printf("  %-22s  [%s] %s\n",
