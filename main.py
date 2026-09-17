@@ -200,6 +200,14 @@ DEFAULT_SETTINGS = {
     "workers":             max(1, (os.cpu_count() or 2) // 2),
     "single_thread":       False,
     "show_progress":       True,
+    # "normal"  — end-to-end backprop through every layer, every step (default)
+    # "staged"  — greedy layer-by-layer warm-up first (see train_staged_block
+    #             below), THEN a normal end-to-end fine-tune for `epochs`.
+    #             Lower peak memory during warm-up (only one block's
+    #             activations/grads live at a time); useful for very deep
+    #             models or constrained RAM.
+    "train_mode":          "normal",
+    "stage_epochs":        1,       # epochs per layer during staged warm-up
     # ── Generation ───────────────────────────────────────────────────────
     "max_generate_tokens": 80,
     "temperature":         0.8,
@@ -603,6 +611,116 @@ def compute_loss_and_dlogits(logits, targets):
     return float(_to_numpy(loss)), dlogits
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Staged (layer-by-layer) training
+#
+# Normal mode backprops through the whole stack every step. Staged mode
+# instead trains one block at a time: blocks before it run forward-only
+# (their caches are thrown away immediately, so nothing about them is kept
+# for backprop) and a small throwaway "stage head" (LayerNorm + Linear ->
+# vocab) sits on top of the block being trained so it has something to fit
+# against. Only that one block's activations/gradients are ever live at
+# once. Once every block has had its warm-up pass, the stage head is
+# discarded and a normal end-to-end fine-tune trains the whole stack
+# (plus the real head) together.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _init_stage_head(embed_dim: int, vocab_size: int, seed: int) -> Dict[str, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    return {
+        'stage_ln_g':   np.ones(embed_dim, dtype=np.float32),
+        'stage_ln_b':   np.zeros(embed_dim, dtype=np.float32),
+        'stage_head_W': (rng.standard_normal((embed_dim, vocab_size)) * INIT_STD).astype(np.float32),
+        'stage_head_b': np.zeros(vocab_size, dtype=np.float32),
+    }
+
+
+def _forward_frozen_prefix(p: Dict[str, object], ctx_ids, upto_li: int, n_heads: int):
+    """Forward through blocks [0, upto_li) with no cache kept — nothing here
+    is ever backpropagated through, so activations aren't retained."""
+    T = ctx_ids.shape[1]
+    x = p['wte'][ctx_ids] + p['wpe'][:T][None, :, :]
+    for li in range(upto_li):
+        x, _ = block_forward(x, p, li, n_heads)   # cache discarded on purpose
+    return x
+
+
+def _stage_forward(p: Dict[str, object], stage_p: Dict[str, object],
+                    ctx_ids, li: int, n_heads: int):
+    x_in = _forward_frozen_prefix(p, ctx_ids, li, n_heads)     # frozen blocks 0..li-1
+    x_out, block_cache = block_forward(x_in, p, li, n_heads)   # the block being trained
+    ln_out, ln_cache = ln_forward(x_out, stage_p['stage_ln_g'], stage_p['stage_ln_b'])
+    logits = ln_out @ stage_p['stage_head_W'] + stage_p['stage_head_b']
+    cache = dict(block_cache=block_cache, ln_cache=ln_cache, ln_out=ln_out)
+    return logits, cache
+
+
+def _stage_backward(stage_p: Dict[str, object], dlogits, cache, li: int):
+    ln_out = cache['ln_out']
+    D = ln_out.shape[-1]
+    V = dlogits.shape[-1]
+
+    stage_grads: Dict[str, object] = {}
+    stage_grads['stage_head_W'] = ln_out.reshape(-1, D).T @ dlogits.reshape(-1, V)
+    stage_grads['stage_head_b'] = dlogits.reshape(-1, V).sum(axis=0)
+
+    dln_out = dlogits @ stage_p['stage_head_W'].T
+    dx_out, dln_g, dln_b = ln_backward(dln_out, cache['ln_cache'])
+    stage_grads['stage_ln_g'] = dln_g
+    stage_grads['stage_ln_b'] = dln_b
+
+    # dx into the frozen prefix is thrown away — nothing before block li
+    # is being trained during its stage.
+    _dx_in, block_grads = block_backward(dx_out, cache['block_cache'], li)
+    return block_grads, stage_grads
+
+
+def train_staged_block(model: "GPT", vocab: Vocabulary, files: List[str],
+                        chunk_tokens: int, li: int, n_heads: int, block_size: int,
+                        batch_size: int, lr: float, lowercase: bool,
+                        stage_epochs: int, show_prog: bool) -> None:
+    """Run the staged warm-up for a single block `li`, mutating model.params
+    in place. Everything else in model.params is left untouched (frozen)."""
+    stage_p = _init_stage_head(model.hp['embed_dim'], vocab.size, seed=1234 + li)
+    stage_p = {k: _to_xp(v) for k, v in stage_p.items()}
+    adam_block = AdamState(lr=lr)
+    adam_stage = AdamState(lr=lr)
+
+    for ep in range(1, stage_epochs + 1):
+        ep_loss = 0.0
+        ep_batches = 0
+        for chunk_toks in _iter_file_chunks(files, lowercase, chunk_tokens):
+            X_cpu, Y_cpu = build_dataset_from_tokens(chunk_toks, vocab, block_size)
+            N = X_cpu.shape[0]
+            if N == 0:
+                continue
+            perm = np.random.permutation(N)
+            X_cpu, Y_cpu = X_cpu[perm], Y_cpu[perm]
+            if _xp is not np:
+                X_dev, Y_dev = _to_xp(X_cpu), _to_xp(Y_cpu)
+            else:
+                X_dev, Y_dev = X_cpu, Y_cpu
+
+            for b_start in range(0, N, batch_size):
+                Xb = X_dev[b_start: b_start + batch_size]
+                Yb = Y_dev[b_start: b_start + batch_size]
+
+                logits, cache = _stage_forward(model.params, stage_p, Xb, li, n_heads)
+                loss, dlogits = compute_loss_and_dlogits(logits, Yb)
+                block_grads, stage_grads = _stage_backward(stage_p, dlogits, cache, li)
+                adam_block.step(model.params, block_grads)
+                adam_stage.step(stage_p, stage_grads)
+
+                ep_loss += loss
+                ep_batches += 1
+
+        if show_prog:
+            print(f"    epoch {ep}/{stage_epochs}  "
+                  f"avg loss={ep_loss / max(1, ep_batches):.4f}")
+    # stage_p (the throwaway head) simply goes out of scope here — only
+    # block li's now-trained weights persist in model.params.
+
+
 class GPT:
     """Decoder-only transformer. `params` is a flat {name: array} dict so the
     existing generic AdamState (and the save/load code) need no changes."""
@@ -970,6 +1088,25 @@ def train(settings: dict) -> None:
     adam = AdamState(lr=lr)
 
     print(f"  Parameters: {human_num(model.num_params())}")
+
+    train_mode   = str(settings.get("train_mode", "normal")).lower()
+    stage_epochs = int(settings.get("stage_epochs", 1))
+
+    if train_mode == "staged":
+        print(f"\n=== Staged warm-up: {n_layers} block(s), "
+              f"{stage_epochs} epoch(s) each ===")
+        for li in range(n_layers):
+            print(f"  -- Stage {li+1}/{n_layers}: training block h{li} "
+                  f"(blocks 0..{li-1} frozen) --" if li > 0 else
+                  f"  -- Stage {li+1}/{n_layers}: training block h{li} --")
+            train_staged_block(model, vocab, files, chunk_tokens, li, n_heads,
+                                block_size, batch_size, lr, lowercase,
+                                stage_epochs, show_prog)
+            model.to_cpu()
+            save_model(model, vocab, settings["model_file"])
+            model.to_device()
+        print(f"\n=== Joint fine-tune: all {n_layers} layers together "
+              f"(train_mode=normal from here) ===")
 
     global_start = time.perf_counter()
 
@@ -1637,7 +1774,8 @@ def show_settings(s: dict) -> None:
         ("Vocabulary",   ["vocab_size"]),
         ("Architecture", ["block_size", "embed_dim", "n_layers", "n_heads", "ffn_dim"]),
         ("Training",     ["epochs", "batch_size", "learning_rate",
-                          "workers", "single_thread", "show_progress"]),
+                          "workers", "single_thread", "show_progress",
+                          "train_mode", "stage_epochs"]),
         ("Generation",   ["max_generate_tokens", "temperature", "top_k"]),
     ]
     for label, keys in groups:
@@ -1848,6 +1986,8 @@ def settings_menu(s: dict) -> None:
         print("  w) Worker count")
         print("  t) Toggle single-thread")
         print("  p) Toggle progress display")
+        print("  m) Toggle training mode (normal/staged)")
+        print("  s) Stage epochs (staged mode)")
         print(" Generation")
         print("  g) Max generated tokens")
         print("  e) Temperature")
@@ -1960,6 +2100,18 @@ def settings_menu(s: dict) -> None:
         elif c == "p":
             s["show_progress"] = not bool(s["show_progress"])
             print("Show progress:", s["show_progress"])
+        elif c == "m":
+            cur = str(s.get("train_mode", "normal")).lower()
+            s["train_mode"] = "staged" if cur != "staged" else "normal"
+            print("Training mode:", s["train_mode"])
+        elif c == "s":
+            v = input("Stage epochs (1-50): ").strip()
+            try:
+                n = int(v)
+                if 1 <= n <= 50:
+                    s["stage_epochs"] = n
+            except ValueError:
+                pass
         elif c == "g":
             v = input("Max generated tokens: ").strip()
             try:
