@@ -1,0 +1,21 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Activations { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Weights     { float w[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Biases      { float b[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Logits     { float y[]; };
+
+layout(push_constant) uniform Shape { uint rows; uint dim; uint vocab; } shape;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint total = shape.rows * shape.vocab;
+    if (index >= total) return;
+    uint row = index / shape.vocab;
+    uint token = index % shape.vocab;
+    float sum = b[token];
+    for (uint d = 0; d < shape.dim; ++d)
+        sum += x[row * shape.dim + d] * w[d * shape.vocab + token];
+    y[index] = sum;
+}

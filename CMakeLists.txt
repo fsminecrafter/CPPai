@@ -10,6 +10,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(WITH_CUDA "Build with CUDA GPU support" OFF)
+option(WITH_VULKAN "Build with Vulkan inference support" OFF)
 
 if(WITH_CUDA)
   enable_language(CUDA)
@@ -21,6 +22,14 @@ if(WITH_CUDA)
   message(STATUS "CUDA enabled — architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 else()
   message(STATUS "CUDA disabled — CPU-only build")
+endif()
+
+if(WITH_VULKAN)
+  find_package(Vulkan REQUIRED)
+  add_compile_definitions(WITH_VULKAN)
+  message(STATUS "Vulkan inference enabled")
+else()
+  message(STATUS "Vulkan inference disabled")
 endif()
 
 if(MSVC)
@@ -45,11 +54,27 @@ set(SOURCES
   src/utils.cpp
 )
 
+if(WITH_VULKAN)
+  list(APPEND SOURCES vulkan/vulkan_ops.cpp)
+  set(VULKAN_SHADER ${CMAKE_BINARY_DIR}/head_projection.spv)
+  add_custom_command(
+    OUTPUT ${VULKAN_SHADER}
+    COMMAND glslc ${CMAKE_SOURCE_DIR}/vulkan/head_projection.comp -o ${VULKAN_SHADER}
+    DEPENDS ${CMAKE_SOURCE_DIR}/vulkan/head_projection.comp
+    VERBATIM)
+  add_custom_target(vulkan_shaders DEPENDS ${VULKAN_SHADER})
+endif()
+
 if(WITH_CUDA)
   list(APPEND SOURCES cuda/cuda_ops.cu)
 endif()
 
 add_executable(pyai ${SOURCES})
+if(WITH_VULKAN)
+  add_dependencies(pyai vulkan_shaders)
+  target_compile_definitions(pyai PRIVATE VULKAN_SHADER_PATH="${VULKAN_SHADER}")
+  target_link_libraries(pyai PRIVATE Vulkan::Vulkan)
+endif()
 
 target_include_directories(pyai PRIVATE
   ${CMAKE_SOURCE_DIR}/src
