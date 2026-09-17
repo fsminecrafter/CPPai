@@ -16,18 +16,28 @@ struct Settings {
     int  vocab_size  = 20000;
     bool lowercase   = true;
 
-    // ── Architecture ──────────────────────────────────────────────────────
-    int ctx_len     = 6;
-    int embed_dim   = 64;
-    int hidden_dim  = 256;
+    // ── Architecture (decoder-only Transformer) ──────────────────────────
+    int block_size  = 128;   // context length (sequence length)
+    int embed_dim   = 128;   // d_model
+    int n_layers    = 4;
+    int n_heads     = 4;
+    int ffn_dim     = 512;   // inner dim of the per-block MLP
 
     // ── Training ──────────────────────────────────────────────────────────
-    int   epochs       = 3;
-    int   batch_size   = 256;
-    float learning_rate = 0.001f;
-    int   workers      = 4;
-    bool  single_thread = false;
-    bool  show_progress = true;
+    int   epochs        = 3;
+    int   batch_size    = 32;     // sequences per batch (not tokens)
+    float learning_rate = 0.0003f;
+    int   workers        = 4;
+    bool  single_thread  = false;
+    bool  show_progress  = true;
+
+    // "normal" — end-to-end backprop through every layer, every step.
+    // "staged" — greedy layer-by-layer warm-up first, then a normal
+    //            end-to-end fine-tune for `epochs`. Lower peak memory
+    //            during warm-up; useful for very deep models or
+    //            constrained RAM.
+    std::string train_mode   = "normal";
+    int         stage_epochs = 1;
 
     // ── Generation ────────────────────────────────────────────────────────
     int   max_generate_tokens = 80;

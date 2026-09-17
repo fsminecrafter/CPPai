@@ -57,7 +57,6 @@ inline constexpr int    GB_DL_TIMEOUT     = 90;   // seconds
 inline constexpr double CHUNK_RAM_FRACTION = 0.40;
 
 // ── Data source identifiers ───────────────────────────────────────────────────
-// Bitmask so they can be combined.
 inline constexpr int DS_GUTENBERG  = 1 << 0;
 inline constexpr int DS_WIKIPEDIA  = 1 << 1;
 inline constexpr int DS_WIKISOURCE = 1 << 2;
@@ -86,12 +85,14 @@ struct Matrix2D {
     }
 };
 
-// ── Hyper-parameters ─────────────────────────────────────────────────────────
+// ── Hyper-parameters  (GPT-style decoder-only transformer) ───────────────────
 struct HParams {
     int vocab_size  = 20000;
-    int embed_dim   = 64;
-    int ctx_len     = 6;
-    int hidden_dim  = 256;
+    int embed_dim   = 128;   // d_model
+    int block_size  = 128;   // context length (sequence length)
+    int n_layers    = 4;
+    int n_heads     = 4;
+    int ffn_dim     = 512;   // inner dim of the per-block MLP
 };
 
 // ── GPU device info ───────────────────────────────────────────────────────────
