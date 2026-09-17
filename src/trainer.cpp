@@ -29,6 +29,9 @@
 #ifdef WITH_CUDA
 #  include "cuda_ops.h"
 #endif
+#ifdef WITH_VULKAN
+#  include "vulkan_ops.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -226,7 +229,7 @@ static double run_batches_with_progress(int chunk_idx, int N, int batch_size,
                 double elapsed  = std::max(0.001, now_sec() - t0);
                 double samp_sec = (static_cast<double>(bd) * batch_size) / elapsed;
                 std::string bar = format_bar(bd, batches_total, 24);
-                printf("\r  Chunk %d %s %5.1f%%  loss=%.4f  %s/s  |  %s    ",
+                printf("\033[2K\r  Chunk %d %s %5.1f%%  loss=%.4f  %s/s  |  %s",
                        chunk_idx, bar.c_str(),
                        100.0 * bd / std::max(1, batches_total),
                        avg_loss.load(std::memory_order_relaxed),
@@ -253,7 +256,7 @@ static double run_batches_with_progress(int chunk_idx, int N, int batch_size,
     if (renderer.joinable()) renderer.join();
     if (show_progress) {
         // Final, exact redraw (the last background frame may be a hair stale).
-        printf("\r  Chunk %d %s 100.0%%  loss=%.4f  |  %s    \n",
+        printf("\033[2K\r  Chunk %d %s 100.0%%  loss=%.4f  |  %s\n",
                chunk_idx, format_bar(batches_total, batches_total, 24).c_str(),
                bi ? total_loss / bi : 0.0, sys_usage_str().c_str());
     }
@@ -443,12 +446,23 @@ void run_train(Settings& s) {
 #ifdef WITH_CUDA
     if (s.use_gpu && s.gpu_backend != "vulkan") {
         auto devs = cuda_enumerate_devices();
-        if (s.gpu_device < static_cast<int>(devs.size())) {
-            cuda_set_device(s.gpu_device);
+        auto device = std::find_if(devs.begin(), devs.end(),
+                                   [&](const GpuDevice& d) { return d.id == s.gpu_device; });
+        if (device == devs.end() && s.gpu_backend == "auto" && !devs.empty()) device = devs.begin();
+        if (device != devs.end()) {
+            s.gpu_device = device->id;
+            cuda_set_device(device->id);
             printf("[GPU] Using CUDA device %d: %s\n",
-                   s.gpu_device, devs[s.gpu_device].name.c_str());
+                   device->id, device->name.c_str());
         } else {
-            printf("[GPU] Device %d not found — falling back to CPU.\n", s.gpu_device);
+            bool vulkan_available = false;
+#ifdef WITH_VULKAN
+            vulkan_available = !vulkan_enumerate_devices().empty();
+#endif
+            if (s.gpu_backend == "auto" && vulkan_available)
+                printf("[GPU] CUDA device %d unavailable; Vulkan is available for inference only. Training will use CPU.\n", s.gpu_device);
+            else
+                printf("[GPU] CUDA device %d not found — falling back to CPU.\n", s.gpu_device);
             s.use_gpu = false;
         }
     } else if (s.use_gpu) {
