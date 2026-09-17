@@ -24,14 +24,16 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
                                         bool show_progress);
 
 // ── Dataset chunk ─────────────────────────────────────────────────────────────
-// Builds X [N×ctx_len] and Y [N] from a flat encoded token sequence.
+// Builds non-overlapping X/Y sequences of shape [N × block_size] from a
+// flat encoded token sequence.  Every position is trained to predict the
+// following token (teacher forcing).
 
-struct DatasetChunk {
-    std::vector<int32_t> X;   // [N × ctx_len]
-    std::vector<int32_t> Y;   // [N]
+struct SeqDataset {
+    std::vector<int32_t> X;   // [N × block_size]
+    std::vector<int32_t> Y;   // [N × block_size]
     int N = 0;
 
-    void build(const std::vector<int32_t>& ids, int ctx_len, int pad_id);
+    void build(const std::vector<int32_t>& ids, int block_size);
     void shuffle();  // Fisher-Yates
 };
 
@@ -39,5 +41,5 @@ struct DatasetChunk {
 void run_train(Settings& s);
 
 // ── Model I/O (gzip-compressed binary) ───────────────────────────────────────
-bool save_model(const NeuralLM& model, const Vocabulary& vocab, const std::string& path);
-bool load_model(const std::string& path, NeuralLM& model_out, Vocabulary& vocab_out);
+bool save_model(const GPT& model, const Vocabulary& vocab, const std::string& path);
+bool load_model(const std::string& path, GPT& model_out, Vocabulary& vocab_out);

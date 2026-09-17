@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <numeric>
 #include <iostream>
+#include <stdexcept>
 #include <ostream>
 #include <istream>
 
@@ -755,6 +756,15 @@ GPT GPT::read(std::istream& in) {
     in.read(reinterpret_cast<char*>(&hp.n_layers),   4);
     in.read(reinterpret_cast<char*>(&hp.n_heads),    4);
     in.read(reinterpret_cast<char*>(&hp.ffn_dim),    4);
+
+    if (!in || hp.vocab_size < 2 || hp.vocab_size > 1000000 ||
+        hp.embed_dim < 1 || hp.embed_dim > 16384 ||
+        hp.block_size < 1 || hp.block_size > 16384 ||
+        hp.n_layers < 1 || hp.n_layers > 256 ||
+        hp.n_heads < 1 || hp.n_heads > hp.embed_dim ||
+        hp.embed_dim % hp.n_heads != 0 || hp.ffn_dim < 1 || hp.ffn_dim > 65536) {
+        throw std::runtime_error("Unsupported or corrupt GPT model file");
+    }
 
     GPT m;
     m.hp_ = hp;

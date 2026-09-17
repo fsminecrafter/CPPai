@@ -1,16 +1,17 @@
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 echo "Dependencies (apt)"
-apt install -y --no-install-recommends \
+apt-get update
+apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     python3-dev \
     python3-pip \
-    zlib1g-dev 
+    zlib1g-dev \
+    curl
 
 echo "Compilation..."
-rm -rf build
-mkdir build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA="${WITH_CUDA:-OFF}"
 cmake --build build --parallel $(nproc)
-mv build/pyai "$PWD"
+cp build/pyai "$PWD/pyai"

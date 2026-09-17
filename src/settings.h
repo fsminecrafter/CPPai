@@ -9,7 +9,7 @@
 struct Settings {
     // ── Files ─────────────────────────────────────────────────────────────
     std::string input_folder   = "input_files";
-    std::string model_file     = "model.nlm";
+    std::string model_file     = "model.nlm.gz";
     std::string settings_file  = "settings.json";
 
     // ── Vocabulary ────────────────────────────────────────────────────────

@@ -80,6 +80,20 @@ struct FwdCache {
     std::vector<float> lnf_out;   // [N x D]
 };
 
+// Temporary output head and cache used by staged layer-wise warm-up. The head
+// is intentionally discarded after a stage; only the selected transformer
+// block is retained in the model.
+struct StageHead {
+    std::vector<float> ln_g, ln_b;
+    std::vector<float> head_W, head_b;
+};
+
+struct StageCache {
+    BlockCache block;
+    LNCache ln;
+    std::vector<float> ln_out;
+};
+
 // ── Adam optimiser state — same shapes as Params ──────────────────────────────
 struct AdamState {
     float lr    = 0.0003f;
@@ -142,3 +156,12 @@ private:
 // used both as the CPU loss and to prepare GPU dlogits uploads.
 float compute_loss_and_dlogits(const float* logits, const int32_t* targets,
                                 int B, int T, int V, std::vector<float>& dlogits);
+
+StageHead init_stage_head(int embed_dim, int vocab_size, unsigned seed);
+void gpt_stage_forward(const Params& p, const HParams& hp, const StageHead& sh,
+                       const std::vector<float>& x_in, int B, int T, int layer,
+                       std::vector<float>& logits_out, StageCache& cache);
+void gpt_stage_backward(const Params& p, const HParams& hp, const StageHead& sh,
+                        const float* dlogits, const StageCache& cache,
+                        int B, int T, int layer,
+                        LayerParams& block_grads, StageHead& stage_grads);

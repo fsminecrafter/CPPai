@@ -81,9 +81,11 @@ static void show_settings(const Settings& s) {
     printf("  ── Vocabulary\n");
     printf("    vocab_size:    %d\n", s.vocab_size);
     printf("  ── Architecture\n");
-    printf("    ctx_len:       %d\n", s.ctx_len);
+    printf("    block_size:    %d\n", s.block_size);
     printf("    embed_dim:     %d\n", s.embed_dim);
-    printf("    hidden_dim:    %d\n", s.hidden_dim);
+    printf("    n_layers:      %d\n", s.n_layers);
+    printf("    n_heads:       %d\n", s.n_heads);
+    printf("    ffn_dim:       %d\n", s.ffn_dim);
     printf("  ── Training\n");
     printf("    epochs:        %d\n", s.epochs);
     printf("    batch_size:    %d\n", s.batch_size);
@@ -241,7 +243,7 @@ static void settings_menu(Settings& s) {
         printf(" Files / vocab\n");
         printf("  1) Input folder\n  2) Model file\n  3) Toggle lowercase\n  4) Vocab size\n");
         printf(" Architecture\n");
-        printf("  5) ctx_len\n  6) embed_dim\n  7) hidden_dim\n");
+        printf("  5) Block size\n  6) Embed dimension\n  7) Layers\n  h) Attention heads\n  f) FFN dimension\n");
         printf(" Training\n");
         printf("  8) Epochs\n  9) Batch size\n  l) Learning rate\n");
         printf("  w) Workers\n  t) Toggle single-thread\n  p) Toggle progress\n");
@@ -255,9 +257,11 @@ static void settings_menu(Settings& s) {
         else if (c=="2"){ auto v=read_line("Model file: "); if(!v.empty()) s.model_file=v; }
         else if (c=="3"){ s.lowercase=!s.lowercase; printf("Lowercase: %s\n",s.lowercase?"true":"false"); }
         else if (c=="4"){ try{ int n=std::stoi(read_line("Vocab size (1000-100000): ")); if(n>=1000&&n<=100000) s.vocab_size=n; }catch(...){} }
-        else if (c=="5"){ try{ int n=std::stoi(read_line("ctx_len (2-16): "));      if(n>=2&&n<=16)      s.ctx_len=n;    }catch(...){} }
+        else if (c=="5"){ try{ int n=std::stoi(read_line("Block size (2-2048): ")); if(n>=2&&n<=2048) s.block_size=n; }catch(...){} }
         else if (c=="6"){ try{ int n=std::stoi(read_line("embed_dim (16-512): "));   if(n>=16&&n<=512)    s.embed_dim=n;  }catch(...){} }
-        else if (c=="7"){ try{ int n=std::stoi(read_line("hidden_dim (64-2048): ")); if(n>=64&&n<=2048)   s.hidden_dim=n; }catch(...){} }
+        else if (c=="7"){ try{ int n=std::stoi(read_line("Layers (1-64): "));        if(n>=1&&n<=64)      s.n_layers=n;   }catch(...){} }
+        else if (c=="h"){ try{ int n=std::stoi(read_line("Attention heads (1-64): ")); if(n>=1&&n<=64 && s.embed_dim % n == 0) s.n_heads=n; else printf("Heads must divide embed_dim.\n"); }catch(...){} }
+        else if (c=="f"){ try{ int n=std::stoi(read_line("FFN dimension (16-16384): ")); if(n>=16&&n<=16384) s.ffn_dim=n; }catch(...){} }
         else if (c=="8"){ try{ int n=std::stoi(read_line("Epochs (1-100): "));       if(n>=1&&n<=100)     s.epochs=n;     }catch(...){} }
         else if (c=="9"){ try{ int n=std::stoi(read_line("Batch size (32-4096): ")); if(n>=32&&n<=4096)   s.batch_size=n; }catch(...){} }
         else if (c=="l"){ try{ float x=std::stof(read_line("Learning rate: "));      if(x>0&&x<1)         s.learning_rate=x; }catch(...){} }

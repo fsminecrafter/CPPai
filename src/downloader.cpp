@@ -16,6 +16,7 @@
 //                  the 301 Gutenberg redirect is followed automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 #include "downloader.h"
+#include "tokenizer.h"
 #include "utils.h"
 #include "neurallm.h"
 
@@ -147,41 +148,6 @@ static std::string http_get(const std::string& url,
 // Text cleaning helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-static std::string strip_gutenberg_boilerplate(const std::string& raw) {
-    static const std::string START_PAT = "*** START OF";
-    static const std::string END_PAT   = "*** END OF";
-
-    auto ci_find = [](const std::string& hay, const std::string& needle) -> size_t {
-        if (needle.empty()) return std::string::npos;
-        for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
-            bool match = true;
-            for (size_t j = 0; j < needle.size(); ++j) {
-                if (std::toupper((unsigned char)hay[i+j]) !=
-                    std::toupper((unsigned char)needle[j])) { match = false; break; }
-            }
-            if (match) return i;
-        }
-        return std::string::npos;
-    };
-
-    size_t start_pos = ci_find(raw, START_PAT);
-    size_t end_pos   = ci_find(raw, END_PAT);
-
-    size_t text_begin = 0;
-    if (start_pos != std::string::npos) {
-        size_t nl = raw.find('\n', start_pos);
-        text_begin = (nl != std::string::npos) ? nl + 1 : start_pos + START_PAT.size();
-    }
-
-    size_t text_end = raw.size();
-    if (end_pos != std::string::npos && end_pos > text_begin) {
-        text_end = (end_pos > 0) ? end_pos : 0;
-    }
-
-    if (text_end <= text_begin) return raw;
-    return raw.substr(text_begin, text_end - text_begin);
-}
-
 static std::string normalise_whitespace(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -256,7 +222,7 @@ static std::string download_gutenberg(int id, const std::string& folder) {
     auto body = http_get(gutenberg_url(id), GB_DL_TIMEOUT);
     if (body.size() < GB_MIN_BYTES) return {};
 
-    std::string text = normalise_whitespace(strip_gutenberg_boilerplate(body));
+    std::string text = normalise_whitespace(strip_project_gutenberg_boilerplate(body));
     if (text.size() < GB_MIN_BYTES / 2) text = body;
 
     std::ofstream f(dest, std::ios::binary);

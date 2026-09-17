@@ -169,6 +169,18 @@ REJECTED_FILE       = "rejected.json"
 
 WORD_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
+
+def strip_project_gutenberg_boilerplate(text: str) -> str:
+    """Remove Gutenberg's standard legal header/footer without touching other text."""
+    start = re.search(r"^\*{3}\s*START OF\b[^\n]*\r?\n", text,
+                      flags=re.IGNORECASE | re.MULTILINE)
+    if not start:
+        return text
+    end = re.search(r"^\*{3}\s*END OF\b", text[start.end():],
+                    flags=re.IGNORECASE | re.MULTILINE)
+    body = text[start.end():]
+    return body[:end.start()] if end else body
+
 NO_SPACE_BEFORE = {".", ",", "!", "?", ";", ":", "%", ")", "]", "}", "»", "\u201d", "'"}
 NO_SPACE_AFTER  = {"(", "[", "{", "«", "\u201c", "'", "$", "£", "€"}
 
@@ -836,7 +848,7 @@ def load_model(model_file: str) -> Optional[Tuple[GPT, Vocabulary, dict]]:
 def load_tokens_from_file(path: str, lowercase: bool) -> List[str]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()
-    return tokenize(text, lowercase=lowercase)
+    return tokenize(strip_project_gutenberg_boilerplate(text), lowercase=lowercase)
 
 
 def _estimate_chunk_size(block_size: int, sample_tokens: int = 500_000) -> int:
@@ -1399,8 +1411,9 @@ def _download_one_book(book_id: int, folder: str) -> Optional[str]:
             data = resp.read()
         if len(data) < AD_MIN_BYTES:
             return None
-        with open(dest, "wb") as f:
-            f.write(data)
+        text = strip_project_gutenberg_boilerplate(data.decode("utf-8", errors="ignore"))
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(text)
         return dest
     except Exception:
         if os.path.exists(dest):
@@ -1450,10 +1463,12 @@ def _download_one_book_progress(book_id: int, folder: str,
                 status_dict[book_id]['state'] = 'too_small'
             return None
 
+        text = strip_project_gutenberg_boilerplate(data.decode("utf-8", errors="ignore"))
+        encoded = text.encode("utf-8")
         with open(dest, "wb") as f:
-            f.write(data)
+            f.write(encoded)
         with lock:
-            status_dict[book_id] = {'done': len(data), 'total': len(data), 'state': 'done'}
+            status_dict[book_id] = {'done': len(encoded), 'total': len(encoded), 'state': 'done'}
         return dest
 
     except Exception:

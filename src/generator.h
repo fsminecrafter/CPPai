@@ -8,7 +8,7 @@
 #include "settings.h"
 #include <string>
 
-std::string generate_text(NeuralLM& model, const Vocabulary& vocab,
+std::string generate_text(GPT& model, const Vocabulary& vocab,
                            const std::string& prompt,
                            int max_tokens, float temperature, int top_k,
                            bool lowercase);

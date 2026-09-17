@@ -189,10 +189,14 @@ bool load_model(const std::string& path, GPT& model_out, Vocabulary& vocab_out) 
         buf.append(tmp, n);
     gzclose(gz);
 
-    std::istringstream ss(buf, std::ios::binary);
-    vocab_out = Vocabulary::read(ss);
-    model_out = GPT::read(ss);
-    return true;
+    try {
+        std::istringstream ss(buf, std::ios::binary);
+        vocab_out = Vocabulary::read(ss);
+        model_out = GPT::read(ss);
+        return static_cast<bool>(ss);
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

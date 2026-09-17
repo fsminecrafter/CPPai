@@ -74,6 +74,8 @@ void Vocabulary::write(std::ostream& out) const {
 Vocabulary Vocabulary::read(std::istream& in) {
     int32_t sz = 0;
     in.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+    if (sz < 2 || sz > 1000000)
+        throw std::runtime_error("Corrupt vocab: vocabulary size out of range");
     Vocabulary v(sz);
     v.id2tok_.resize(sz);
     for (int i = 0; i < sz; ++i) {

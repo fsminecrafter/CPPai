@@ -112,10 +112,33 @@ std::string detokenize(const std::vector<std::string>& tokens) {
 
 // ── File loader ───────────────────────────────────────────────────────────────
 
+std::string strip_project_gutenberg_boilerplate(const std::string& text) {
+    // Gutenberg's marker wording varies, but these prefixes are stable.
+    auto ci_find = [](const std::string& haystack, const std::string& needle) {
+        for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+            size_t j = 0;
+            for (; j < needle.size(); ++j) {
+                if (std::toupper(static_cast<unsigned char>(haystack[i + j])) !=
+                    std::toupper(static_cast<unsigned char>(needle[j]))) break;
+            }
+            if (j == needle.size()) return i;
+        }
+        return std::string::npos;
+    };
+
+    const size_t start = ci_find(text, "*** START OF");
+    if (start == std::string::npos) return text;
+    const size_t newline = text.find('\n', start);
+    const size_t begin = newline == std::string::npos ? text.size() : newline + 1;
+    const size_t end = ci_find(text, "*** END OF");
+    return end != std::string::npos && end > begin
+        ? text.substr(begin, end - begin) : text.substr(begin);
+}
+
 std::vector<std::string> tokenize_file(const std::string& path, bool lowercase) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return {};
     std::ostringstream ss;
     ss << f.rdbuf();
-    return tokenize(ss.str(), lowercase);
+    return tokenize(strip_project_gutenberg_boilerplate(ss.str()), lowercase);
 }

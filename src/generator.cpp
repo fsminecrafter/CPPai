@@ -19,11 +19,11 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::string generate_text(NeuralLM& model, const Vocabulary& vocab,
+std::string generate_text(GPT& model, const Vocabulary& vocab,
                            const std::string& prompt,
                            int max_tokens, float temperature, int top_k,
                            bool lowercase) {
-    const int ctx_len = model.hp().ctx_len;
+    const int block_size = model.hp().block_size;
     const int V       = model.hp().vocab_size;
     const int pad_id  = vocab.pad_id();
     const int unk_id  = vocab.unk_id();
@@ -33,11 +33,11 @@ std::string generate_text(NeuralLM& model, const Vocabulary& vocab,
     std::vector<int32_t> ctx;
     for (auto& t : prompt_toks) ctx.push_back(vocab.encode(t));
 
-    // Pad or trim to ctx_len
-    if (static_cast<int>(ctx.size()) < ctx_len) {
-        ctx.insert(ctx.begin(), ctx_len - static_cast<int>(ctx.size()), pad_id);
+    // Pad or trim to the transformer's fixed context window.
+    if (static_cast<int>(ctx.size()) < block_size) {
+        ctx.insert(ctx.begin(), block_size - static_cast<int>(ctx.size()), pad_id);
     } else {
-        ctx = std::vector<int32_t>(ctx.end() - ctx_len, ctx.end());
+        ctx = std::vector<int32_t>(ctx.end() - block_size, ctx.end());
     }
 
     std::vector<std::string> generated(prompt_toks);
@@ -45,13 +45,20 @@ std::string generate_text(NeuralLM& model, const Vocabulary& vocab,
     static std::mt19937 rng(std::random_device{}());
 
     for (int step = 0; step < max_tokens; ++step) {
-        auto probs = model.predict_probs(ctx.data());
+        std::vector<float> logits(static_cast<size_t>(block_size) * V);
+        FwdCache cache;
+        model.forward(ctx.data(), 1, block_size, logits.data(), cache);
+
+        // Only the final position predicts the next token.
+        std::vector<float> probs(V);
+        const float* last_logits = logits.data() + static_cast<size_t>(block_size - 1) * V;
+        for (int j = 0; j < V; ++j) probs[j] = last_logits[j];
 
         // Temperature
         float temp = std::max(0.05f, temperature);
         float log_sum = -1e38f;
         for (int j = 0; j < V; ++j) {
-            probs[j] = std::log(probs[j] + 1e-12f) / temp;
+            probs[j] /= temp;
             log_sum  = std::max(log_sum, probs[j]);
         }
         float sum = 0.f;
@@ -103,7 +110,7 @@ void run_chat(Settings& s) {
     s.use_gpu = false;
 #endif
 
-    NeuralLM model;
+    GPT model;
     Vocabulary vocab;
     if (!load_model(s.model_file, model, vocab)) {
         printf("No model found at '%s'. Train first.\n", s.model_file.c_str());
@@ -111,10 +118,10 @@ void run_chat(Settings& s) {
     }
     if (s.use_gpu) model.to_device();
 
-    printf("Model loaded [%s] — vocab=%d  ctx=%d  embed=%d  hidden=%d\n",
+    printf("Model loaded [%s] — vocab=%d  block=%d  embed=%d  layers=%d  heads=%d  ffn=%d\n",
            s.use_gpu ? ("GPU:" + std::to_string(s.gpu_device)).c_str() : "CPU",
-           vocab.size(), model.hp().ctx_len,
-           model.hp().embed_dim, model.hp().hidden_dim);
+           vocab.size(), model.hp().block_size, model.hp().embed_dim,
+           model.hp().n_layers, model.hp().n_heads, model.hp().ffn_dim);
     printf("Type 'exit' to quit.\n\n");
 
     std::string line;
