@@ -14,6 +14,15 @@
 //                  every major distro and macOS).
 //   Windows      — WinHTTP with WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS set so
 //                  the 301 Gutenberg redirect is followed automatically.
+//
+// Progress display
+//   Both the serial and parallel download paths redraw their progress bars
+//   using terminal escape codes (\r, \033[2K, \033[%dA\033[J). Those only
+//   move the cursor on a real TTY — when stdout is piped, redirected to a
+//   file, or run inside a non-terminal wrapper, the escapes are written out
+//   literally and every redraw becomes a brand-new line. stdout_is_tty()
+//   (utils.h) gates this: on a TTY we redraw in place; otherwise we print
+//   plain, throttled, newline-terminated lines instead.
 // ─────────────────────────────────────────────────────────────────────────────
 #include "downloader.h"
 #include "tokenizer.h"
@@ -251,6 +260,9 @@ static std::vector<int> discover_gutenberg_ids(
     std::mutex mu;
     std::atomic<int> cursor{0};
 
+    const bool tty = stdout_is_tty();
+    double last_print = 0.0;
+
     int batch = probe_workers * 4;
     size_t pos = 0;
     while (static_cast<int>(good.size()) < needed && pos < all.size()) {
@@ -276,9 +288,16 @@ static std::vector<int> discover_gutenberg_ids(
         for (auto& t : ths) t.join();
         pos = end;
         if (verbose) {
-            printf("\r  Probing Gutenberg…  found %d/%d IDs   ",
-                   (int)good.size(), needed);
-            fflush(stdout);
+            if (tty) {
+                printf("\r  Probing Gutenberg…  found %d/%d IDs   ",
+                       (int)good.size(), needed);
+                fflush(stdout);
+            } else if (now_sec() - last_print >= 1.0) {
+                printf("  Probing Gutenberg…  found %d/%d IDs\n",
+                       (int)good.size(), needed);
+                fflush(stdout);
+                last_print = now_sec();
+            }
         }
         if (static_cast<int>(good.size()) >= needed) break;
     }
@@ -577,25 +596,45 @@ static void download_serial(const std::vector<DownloadTask>& tasks,
                               int max_books, size_t max_bytes) {
     std::set<int> rejected_local;
     int n = static_cast<int>(tasks.size());
+    const bool tty = stdout_is_tty();
     for (int i = 0; i < n; ++i) {
         auto st = folder_state(folder);
         if (st.count >= max_books || st.bytes >= max_bytes) break;
-        printf("\r  %s  [%s] %d …%s",
-               format_bar(i, n, 24).c_str(),
-               source_label(tasks[i].source),
-               tasks[i].seq_id,
-               "           ");
-        fflush(stdout);
+        if (tty) {
+            printf("\r  %s  [%s] %d …%s",
+                   format_bar(i, n, 24).c_str(),
+                   source_label(tasks[i].source),
+                   tasks[i].seq_id,
+                   "           ");
+            fflush(stdout);
+        } else {
+            printf("  %s  [%s] %d …\n",
+                   format_bar(i, n, 24).c_str(),
+                   source_label(tasks[i].source),
+                   tasks[i].seq_id);
+            fflush(stdout);
+        }
         auto path = dispatch_download(tasks[i], folder);
         if (!path.empty()) {
             size_t sz = fs::file_size(path);
-            printf("\r  ✓ %s  (%s)%s\n",
-                   fs::path(path).filename().string().c_str(),
-                   human_bytes(sz).c_str(), "                    ");
+            if (tty) {
+                printf("\r  ✓ %s  (%s)%s\n",
+                       fs::path(path).filename().string().c_str(),
+                       human_bytes(sz).c_str(), "                    ");
+            } else {
+                printf("  ✓ %s  (%s)\n",
+                       fs::path(path).filename().string().c_str(),
+                       human_bytes(sz).c_str());
+            }
         } else {
-            printf("\r  ✗ [%s] %d  (failed)%s\n",
-                   source_label(tasks[i].source), tasks[i].seq_id,
-                   "                    ");
+            if (tty) {
+                printf("\r  ✗ [%s] %d  (failed)%s\n",
+                       source_label(tasks[i].source), tasks[i].seq_id,
+                       "                    ");
+            } else {
+                printf("  ✗ [%s] %d  (failed)\n",
+                       source_label(tasks[i].source), tasks[i].seq_id);
+            }
             if (tasks[i].source == DS_GUTENBERG)
                 rejected_local.insert(tasks[i].seq_id);
         }
@@ -636,40 +675,46 @@ static void download_parallel(const std::vector<DownloadTask>& tasks,
     std::set<int> rejected_gutenberg;
     double started = now_sec();
     int prev_lines = 0;
+    const bool tty = stdout_is_tty();
 
-    auto render = [&]() {
-        if (prev_lines > 0)
-            printf("\033[%dA\033[J", prev_lines);
-
+    // Builds the full multi-line status block as one string, used by both
+    // the TTY (redraw-in-place) and non-TTY (throttled snapshot) paths so
+    // the two never drift apart.
+    auto build_block = [&]() -> std::string {
         std::lock_guard<std::mutex> lk(mu);
+        std::ostringstream out;
         int bar_w = 18;
-        int lines = 0;
         for (auto& st : status) {
             std::string lbl = std::string(source_label(st.source))
                             + "/" + std::to_string(st.seq_id);
             if (st.state == "done") {
-                printf("  %-22s  [%s] ✓  %s\n",
-                       lbl.c_str(), std::string(bar_w,'=').c_str(),
-                       human_bytes(st.done).c_str());
+                out << "  " << std::left << std::setw(22) << lbl
+                    << "  [" << std::string(bar_w, '=') << "] \xE2\x9C\x93  "
+                    << human_bytes(st.done) << "\n";
             } else if (st.state == "failed") {
-                printf("  %-22s  [%-*s] FAILED\n", lbl.c_str(), bar_w, "✗");
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  %-22s  [%-*s] FAILED\n", lbl.c_str(), bar_w, "\xE2\x9C\x97");
+                out << buf;
             } else if (st.state == "skipped") {
-                printf("  %-22s  [cap reached]\n", lbl.c_str());
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  %-22s  [cap reached]\n", lbl.c_str());
+                out << buf;
             } else if (st.state == "downloading" || st.state == "connecting") {
                 int filled = (st.total > 0)
                     ? static_cast<int>((double)st.done / st.total * bar_w)
                     : std::min((int)(st.done / (GB_MIN_BYTES * 4.0) * bar_w), bar_w-1);
-                // Keep the trailing-arrow calculation valid even if a
-                // transport reports more bytes than its Content-Length.
                 filled = std::clamp(filled, 0, bar_w - 1);
                 std::string bar(filled, '=');
                 bar += '>'; bar.append(bar_w - filled - 1, '-');
-                printf("  %-22s  [%s] %s\n",
-                       lbl.c_str(), bar.c_str(), human_bytes(st.done).c_str());
+                char buf[160];
+                snprintf(buf, sizeof(buf), "  %-22s  [%s] %s\n",
+                         lbl.c_str(), bar.c_str(), human_bytes(st.done).c_str());
+                out << buf;
             } else {
-                printf("  %-22s  [pending]\n", lbl.c_str());
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  %-22s  [pending]\n", lbl.c_str());
+                out << buf;
             }
-            ++lines;
         }
         int done_n = finished.load();
         double elapsed = std::max(0.001, now_sec() - started);
@@ -678,11 +723,18 @@ static void download_parallel(const std::vector<DownloadTask>& tasks,
             double e = (elapsed / done_n) * (n - done_n);
             char buf[32]; snprintf(buf, sizeof(buf), "ETA %.0fs", e); eta = buf;
         } else eta = "ETA…";
-        printf("  Overall %s %d/%d  %s  elapsed %.0fs\n",
-               format_bar(done_n, n, 28).c_str(), done_n, n, eta.c_str(), elapsed);
-        ++lines;
-        prev_lines = lines;
+        out << "  Overall " << format_bar(done_n, n, 28) << " " << done_n << "/" << n
+            << "  " << eta << "  elapsed " << std::fixed << std::setprecision(0) << elapsed << "s\n";
+        return out.str();
+    };
+
+    auto render_tty = [&]() {
+        if (prev_lines > 0)
+            printf("\033[%dA\033[J", prev_lines);
+        std::string block = build_block();
+        fputs(block.c_str(), stdout);
         fflush(stdout);
+        prev_lines = static_cast<int>(std::count(block.begin(), block.end(), '\n'));
     };
 
     std::vector<std::future<void>> futures;
@@ -727,13 +779,34 @@ static void download_parallel(const std::vector<DownloadTask>& tasks,
 
     std::atomic<bool> stop_render{false};
     std::thread render_thread([&]() {
-        while (!stop_render.load()) { render(); sleep_ms(250); }
+        if (tty) {
+            while (!stop_render.load()) { render_tty(); sleep_ms(250); }
+        } else {
+            // No cursor control — print a fresh, complete snapshot at most
+            // once a second instead of redrawing in place.
+            double last_print = 0.0;
+            while (!stop_render.load()) {
+                double now = now_sec();
+                if (now - last_print >= 1.0) {
+                    printf("  [%d/%d done]\n%s", finished.load(), n, build_block().c_str());
+                    fflush(stdout);
+                    last_print = now;
+                }
+                sleep_ms(200);
+            }
+        }
     });
 
     for (auto& f : futures) f.get();
     stop_render.store(true);
     render_thread.join();
-    render();
+
+    if (tty) {
+        render_tty();
+    } else {
+        printf("  [%d/%d done]\n%s", finished.load(), n, build_block().c_str());
+        fflush(stdout);
+    }
 
     if (!rejected_gutenberg.empty()) {
         auto rej  = load_id_cache("rejected.json");

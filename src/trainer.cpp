@@ -50,6 +50,7 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
 
     int n_files = static_cast<int>(files.size());
     std::atomic<int> done_count{0};
+    const bool tty = stdout_is_tty();
 
     if (show_progress) {
         printf("  Pass 1/2 — counting tokens for vocabulary…\n");
@@ -57,15 +58,25 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
     }
 
     if (single_thread || workers <= 1) {
+        double last_print = now_sec();
         for (int i = 0; i < n_files; ++i) {
             auto toks = tokenize_file(files[i], lowercase);
             for (auto& t : toks) counts[t]++;
             res.total_tokens += static_cast<int64_t>(toks.size());
             if (show_progress) {
-                printf("\r  Loading %s %d/%d files  (%s tokens)",
-                       format_bar(i+1, n_files, 28).c_str(), i+1, n_files,
-                       human_num(static_cast<double>(res.total_tokens)).c_str());
-                fflush(stdout);
+                bool last = (i + 1 == n_files);
+                if (tty) {
+                    printf("\r  Loading %s %d/%d files  (%s tokens)",
+                           format_bar(i+1, n_files, 28).c_str(), i+1, n_files,
+                           human_num(static_cast<double>(res.total_tokens)).c_str());
+                    fflush(stdout);
+                } else if (last || now_sec() - last_print >= 1.0) {
+                    printf("  Loading %s %d/%d files  (%s tokens)\n",
+                           format_bar(i+1, n_files, 28).c_str(), i+1, n_files,
+                           human_num(static_cast<double>(res.total_tokens)).c_str());
+                    fflush(stdout);
+                    last_print = now_sec();
+                }
             }
         }
     } else {
@@ -90,17 +101,29 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
         }
 
         // Progress display runs on this (calling) thread independently of the
-        // worker threads, so it redraws at a fixed cadence rather than only
-        // when a worker happens to finish a file.
+        // worker threads. On a real TTY it redraws in place at a fixed
+        // cadence; when stdout isn't a TTY (piped/redirected/logged), \r and
+        // \033[2K are written out literally instead of moving the cursor, so
+        // every redraw would become a new line — throttle to one line/sec
+        // there instead.
+        double last_print = now_sec();
         while (done_count.load() < n_files) {
             if (show_progress) {
                 int dc = done_count.load();
                 int64_t total_so_far = 0;
                 for (auto& wt : worker_tokens) total_so_far += wt;
-                printf("\r  Loading %s %d/%d files  (%s tokens)",
-                       format_bar(dc, n_files, 28).c_str(), dc, n_files,
-                       human_num(static_cast<double>(total_so_far)).c_str());
-                fflush(stdout);
+                if (tty) {
+                    printf("\r  Loading %s %d/%d files  (%s tokens)",
+                           format_bar(dc, n_files, 28).c_str(), dc, n_files,
+                           human_num(static_cast<double>(total_so_far)).c_str());
+                    fflush(stdout);
+                } else if (now_sec() - last_print >= 1.0) {
+                    printf("  Loading %s %d/%d files  (%s tokens)\n",
+                           format_bar(dc, n_files, 28).c_str(), dc, n_files,
+                           human_num(static_cast<double>(total_so_far)).c_str());
+                    fflush(stdout);
+                    last_print = now_sec();
+                }
             }
             sleep_ms(100);
         }
@@ -109,6 +132,11 @@ VocabBuildResult build_vocab_streaming(const std::vector<std::string>& files,
         for (int w = 0; w < actual_workers; ++w) {
             for (auto& [tok, cnt] : partial[w]) counts[tok] += cnt;
             res.total_tokens += worker_tokens[w];
+        }
+        if (show_progress && !tty) {
+            printf("  Loading %s %d/%d files  (%s tokens)\n",
+                   format_bar(n_files, n_files, 28).c_str(), n_files, n_files,
+                   human_num(static_cast<double>(res.total_tokens)).c_str());
         }
     }
 
@@ -205,17 +233,21 @@ bool load_model(const std::string& path, GPT& model_out, Vocabulary& vocab_out) 
 // ─────────────────────────────────────────────────────────────────────────────
 // Threaded progress bar for a run of batches.
 //
-// The renderer runs on its own thread and redraws at a fixed ~80ms cadence
-// (read from atomics the compute thread updates after each batch), so the
-// bar's on-screen refresh rate no longer depends on how fast a batch runs —
-// it stays smooth whether a batch takes 2ms (small model, GPU) or 200ms
-// (large model, CPU).
+// The renderer runs on its own thread. On a real TTY it redraws at a fixed
+// ~80ms cadence using \r + \033[2K, so the bar's on-screen refresh rate
+// doesn't depend on batch speed. When stdout is NOT a TTY (piped, redirected
+// to a file, or run inside a non-terminal wrapper), those escape codes are
+// written out literally instead of moving the cursor — every redraw becomes
+// a brand-new line, which is exactly the "prints hundreds of duplicate
+// lines" symptom. In that case we throttle to one plain line per second
+// instead of redrawing every tick.
 // ─────────────────────────────────────────────────────────────────────────────
 
 template <typename StepFn>
 static double run_batches_with_progress(int chunk_idx, int N, int batch_size,
                                          bool show_progress, StepFn&& step_fn) {
     const int batches_total = (N + batch_size - 1) / batch_size;
+    const bool tty = stdout_is_tty();
     std::atomic<int>    batches_done{0};
     std::atomic<double> avg_loss{0.0};
     std::atomic<bool>   active{true};
@@ -224,19 +256,35 @@ static double run_batches_with_progress(int chunk_idx, int N, int batch_size,
     std::thread renderer;
     if (show_progress) {
         renderer = std::thread([&]() {
+            double last_print = 0.0;
             while (active.load(std::memory_order_relaxed)) {
                 int bd = batches_done.load(std::memory_order_relaxed);
                 double elapsed  = std::max(0.001, now_sec() - t0);
                 double samp_sec = (static_cast<double>(bd) * batch_size) / elapsed;
                 std::string bar = format_bar(bd, batches_total, 24);
-                printf("\033[2K\r  Chunk %d %s %5.1f%%  loss=%.4f  %s/s  |  %s",
-                       chunk_idx, bar.c_str(),
-                       100.0 * bd / std::max(1, batches_total),
-                       avg_loss.load(std::memory_order_relaxed),
-                       human_num(samp_sec).c_str(),
-                       sys_usage_str().c_str());
-                fflush(stdout);
-                sleep_ms(80);
+                if (tty) {
+                    printf("\033[2K\r  Chunk %d %s %5.1f%%  loss=%.4f  %s/s  |  %s",
+                           chunk_idx, bar.c_str(),
+                           100.0 * bd / std::max(1, batches_total),
+                           avg_loss.load(std::memory_order_relaxed),
+                           human_num(samp_sec).c_str(),
+                           sys_usage_str().c_str());
+                    fflush(stdout);
+                    sleep_ms(80);
+                } else {
+                    double now = now_sec();
+                    if (now - last_print >= 1.0) {
+                        printf("  Chunk %d %s %5.1f%%  loss=%.4f  %s/s  |  %s\n",
+                               chunk_idx, bar.c_str(),
+                               100.0 * bd / std::max(1, batches_total),
+                               avg_loss.load(std::memory_order_relaxed),
+                               human_num(samp_sec).c_str(),
+                               sys_usage_str().c_str());
+                        fflush(stdout);
+                        last_print = now;
+                    }
+                    sleep_ms(200);
+                }
             }
         });
     }
@@ -256,7 +304,10 @@ static double run_batches_with_progress(int chunk_idx, int N, int batch_size,
     if (renderer.joinable()) renderer.join();
     if (show_progress) {
         // Final, exact redraw (the last background frame may be a hair stale).
-        printf("\033[2K\r  Chunk %d %s 100.0%%  loss=%.4f  |  %s\n",
+        // Always a single terminated line, TTY or not.
+        if (tty) printf("\033[2K\r");
+        else     printf("  ");
+        printf("Chunk %d %s 100.0%%  loss=%.4f  |  %s\n",
                chunk_idx, format_bar(batches_total, batches_total, 24).c_str(),
                bi ? total_loss / bi : 0.0, sys_usage_str().c_str());
     }

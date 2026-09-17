@@ -10,6 +10,13 @@
 // Terminal width (fallback 80)
 int term_width();
 
+// True if stdout is attached to an interactive terminal. Carriage-return /
+// ANSI-clear based progress redraws only make sense when this is true —
+// when stdout is piped or redirected, those escape sequences are written
+// out literally (invisible) and every redraw becomes a new line instead of
+// overwriting the previous one.
+bool stdout_is_tty();
+
 // ASCII progress bar [====----]
 std::string format_bar(int done, int total, int width = 30);
 

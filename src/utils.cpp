@@ -19,6 +19,7 @@ namespace fs = std::filesystem;
 #ifdef NLM_WINDOWS
 #  include <windows.h>
 #  include <psapi.h>
+#  include <io.h>
 #else
 #  include <sys/ioctl.h>
 #  include <unistd.h>
@@ -40,6 +41,20 @@ int term_width() {
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) return w.ws_col;
 #endif
     return 80;
+}
+
+bool stdout_is_tty() {
+    // Cached after first call — this can't change mid-process for our use case,
+    // and isatty()/GetFileType() are cheap but no need to call them every redraw.
+    static int cached = -1;
+    if (cached < 0) {
+#ifdef NLM_WINDOWS
+        cached = _isatty(_fileno(stdout)) ? 1 : 0;
+#else
+        cached = isatty(fileno(stdout)) ? 1 : 0;
+#endif
+    }
+    return cached == 1;
 }
 
 std::string format_bar(int done, int total, int width) {
